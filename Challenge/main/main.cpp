@@ -28,14 +28,14 @@
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include <cmath>
-#include "Stepper.h"
+#include "include/Stepper.h"
 #include "SimpleGPIO.h"
 // ── Stepper J1 ─────────────────────────────────────────────────────────
 
 #define INTERRUPT_PIN   GPIO_NUM_1    // same as S1_STEP pin
 #define step_per_rev    200
+static uint8_t STEPPERPINS[2] = {1, 2};
 
-static stepper_pins_t STEPPERPINS = {S1_STEP, S1_DIR, S1_EN};
 
 static TimerConfig timer = {
     .timer          = LEDC_TIMER_1,        // TIMER_0 is used by DC motors, use TIMER_1

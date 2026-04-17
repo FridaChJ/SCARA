@@ -23,7 +23,7 @@ static const std::string TOPIC_ENCODERS     = "robot/encoders";       // Topic t
 
 //========================= Pin Definitions ===============================
 // Stepper motors
-constexpr int S1_STEP = 1,  S1_DIR = 2,  S1_EN = 20;          // Joint 1 stepper motor pins
+
 constexpr int S2_STEP = 4,  S2_DIR = 5, S2_EN = 6;          // Joint 2 stepper motor pins
 constexpr int S2_LIMIT_PIN = 7;   // GPIO for J2 limit switch (active LOW, internal pull-up)
 
