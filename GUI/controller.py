@@ -66,7 +66,7 @@ class Controller:
         """
         Called from MQTT thread. Updates GUI with encoder feedback and history.
         """
-        if topic == "robot/feedback":
+        if topic == "robot/encoders":
             encoders = payload.get("encoders", [])
 
             # Push data to queue for GUI thread

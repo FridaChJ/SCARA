@@ -159,7 +159,7 @@ def main() -> None:
   global manual_target_angles  # ← add this line
   #Instantiate main classes
   mqtt = MQTTClient(
-    broker_ip            ="192.168.100.14", 
+    broker_ip            ="192.168.4.87", 
     port                 =1883,
     username             ="Friii",
     password             ="12345678",

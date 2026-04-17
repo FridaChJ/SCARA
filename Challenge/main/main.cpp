@@ -2,114 +2,92 @@
 // main.cpp  —  ESP32-S3 Controller
 // Authors     : Frida Sophia Chavez Juarez
 // Mentor      : Oscar Vargas Perez
-// Last updated: 2026-04-13
+// Last updated: 2026-04-17
 //
-// Change vs previous version:
-//   - StepperMotor and HBridge constructors/setup now receive joint labels
-//     ("J1","J2","J3","J4") so every log line identifies which motor is acting.
-//   - TARGET_READY_BIT is cleared when MotorManager::update() returns true,
-//     meaning ALL joints are within deadband. This stops the PID loop (and
-//     the setStop spam) once the robot has reached the target position.
+// Simplified control — no MotorManager, no PID:
+//   • Receives target angles via MQTT (topic: robot/motor_angles)
+//   • Publishes encoder feedback via MQTT (topic: robot/encoders)
+//   • DC Motor 1 (J3) and DC Motor 2 (J4) — run simultaneously:
+//       - Positive target → spin RIGHT at up to 60% duty
+//       - Negative target → spin LEFT  at up to 60% duty
+//       - Proportional slowdown inside SLOW_ZONE degrees of target
+//       - Stops when within STOP_ZONE degrees of target
 // =============================================================================
 
-#include <string>
-#include <cstring>
-#include <cstdlib>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
+#include "definitions.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
-#include "nvs_flash.h"
 #include "esp_task_wdt.h"
-#include "cJSON.h"
-
-#include "MotorAngles.h"
 #include "MqttClient.h"
 #include "Encoders.h"
-#include "DriverStepper.h"
+#include "MotorAngles.h"
 #include "HBridge.h"
 #include "SimplePWM.h"
-#include "PIDcontroller.h"
-#include "MotorManager.h"
+#include "nvs_flash.h"
+#include "cJSON.h"
 
 static const char* TAG = "main";
+static const TickType_t LOOP_TICKS = pdMS_TO_TICKS(20); // 50 Hz
+static volatile float  s_j1_position  = 0.0f;   // tracks current stepper position (degrees)
+static volatile bool   s_j1_direction = true;    // true = CW, false = CCW
+static volatile long   s_j1_steps     = 0;       // total step count
 
-#define WIFI_SSID      "Friii"
-#define WIFI_PASSWORD  "12345678"
+static float ShortPath(float current, float target) {
+    float error = target - current;
+    if (error >  180.0f) error -= 360.0f;
+    if (error < -180.0f) error += 360.0f;
+    return error;
+}
 
-static const std::string BROKER_URI         = "mqtt://192.168.100.14:1883";
-static const std::string BROKER_USER        = "";
-static const std::string BROKER_PASS        = "";
-static const std::string TOPIC_MOTOR_ANGLES = "robot/motor_angles";
-static const std::string TOPIC_ENCODERS     = "robot/encoders";
+static void IRAM_ATTR j1_step_handler(void* arg) {
+    float step_degrees = 360.0f / step_per_rev;
+    if (s_j1_direction) s_j1_position += step_degrees;
+    else                s_j1_position -= step_degrees;
+    if (s_j1_position >= 360.0f) s_j1_position -= 360.0f;
+    if (s_j1_position <    0.0f) s_j1_position += 360.0f;
+    s_j1_steps++;
+}
+// =============================================================================
+// Motor tuning constants  — adjust these to taste
+// =============================================================================
+static constexpr float MAX_DUTY_J3  = 60.0f;  // full-speed PWM duty (%) for J3
+static constexpr float MAX_DUTY_J4  = 60.0f;  // full-speed PWM duty (%) for J4
+static constexpr float SLOW_ZONE    = 15.0f;  // degrees from target → start slowing
+static constexpr float STOP_ZONE    =  1.5f;  // degrees from target → stop completely
+static constexpr float MIN_DUTY_J3  = 20.0f;  // minimum duty while still moving (%) J3
+static constexpr float MIN_DUTY_J4  = 20.0f;  // minimum duty while still moving (%) J4
 
-static const TickType_t LOOP_TICKS = pdMS_TO_TICKS(20);   // 50 Hz
-
-// ── Pin definitions ──────────────────────────────────────────────────────────
-static const int S1_STEP = 4,  S1_DIR = 5,  S1_EN = 6;
-static const int S2_STEP = 7,  S2_DIR = 8,  S2_EN = 9;
-
-static uint8_t DC1_PINS[2] = {10, 11};
-static uint8_t DC1_CH[2]   = {0,  1};
-static uint8_t DC2_PINS[2] = {12, 13};
-static uint8_t DC2_CH[2]   = {2,  3};
-
-static const gpio_num_t ENC_J1_SDA = GPIO_NUM_8,  ENC_J1_SCL = GPIO_NUM_9;
-static const gpio_num_t ENC_J2_SDA = GPIO_NUM_14, ENC_J2_SCL = GPIO_NUM_15;
-
-static uint8_t ENC_J3_PINS[2] = {34, 35};
-static uint8_t ENC_J4_PINS[2] = {36, 39};
-
-static const float DEG_PER_EDGE_J3 = 0.1f;
-static const float DEG_PER_EDGE_J4 = 0.1f;
-
-// ── PID gains ────────────────────────────────────────────────────────────────
-static const float J1_KP = 1.0f, J1_KI = 0.0f, J1_KD = 0.0f;
-static const float J2_KP = 1.0f, J2_KI = 0.0f, J2_KD = 0.0f;
-static const float J3_KP = 1.0f, J3_KI = 0.0f, J3_KD = 0.0f;
-static const float J4_KP = 1.0f, J4_KI = 0.0f, J4_KD = 0.0f;
-static const float MAX_DUTY = 80.0f;
-
-// ── Shared state ─────────────────────────────────────────────────────────────
-// TARGET_READY_BIT: set when a new MQTT target arrives, cleared when all
-// joints converge (MotorManager::update() returns true).
-#define TARGET_READY_BIT  BIT0
-
+// =============================================================================
+// Shared State
+// =============================================================================
 static EventGroupHandle_t s_ctrl_events = nullptr;
 static portMUX_TYPE       s_angle_mux   = portMUX_INITIALIZER_UNLOCKED;
 static MotorAngles         s_target      = {};
 
-// ── WiFi ─────────────────────────────────────────────────────────────────────
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
-
+// =============================================================================
+// WiFi
+// =============================================================================
 static EventGroupHandle_t s_wifi_event_group = nullptr;
 static int s_retry_num = 0;
 
 static void wifi_event_handler(void* arg, esp_event_base_t base,
-                               int32_t id, void* data)
+                                int32_t id, void* data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t* event =
-            (wifi_event_sta_disconnected_t*) data;
+        wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*)data;
         if (s_retry_num < 10) {
             s_retry_num++;
-            ESP_LOGI(TAG, "[WiFi] Retry %d/10 (reason %d)…",
-                     s_retry_num, event->reason);
+            ESP_LOGI(TAG, "[WiFi] Retry %d/10 (reason %d)...", s_retry_num, event->reason);
             esp_wifi_connect();
         } else {
-            ESP_LOGE(TAG, "[WiFi] Failed after 10 retries. Last reason: %d",
-                     event->reason);
+            ESP_LOGE(TAG, "[WiFi] Failed after 10 retries. Last reason: %d", event->reason);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
-    }
-    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) data;
-        ESP_LOGI(TAG, "[WiFi] Connected — IP: " IPSTR,
-                 IP2STR(&event->ip_info.ip));
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*)data;
+        ESP_LOGI(TAG, "[WiFi] Connected — IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -140,17 +118,17 @@ static bool wifi_init_and_wait(void)
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = {};
-    strncpy((char*)wifi_config.sta.ssid,     WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.ssid,     WIFI_SSID,     sizeof(wifi_config.sta.ssid));
     strncpy((char*)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode  = WIFI_AUTH_WPA_PSK;
-    wifi_config.sta.pmf_cfg.capable     = true;
-    wifi_config.sta.pmf_cfg.required    = false;
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+    wifi_config.sta.pmf_cfg.capable    = true;
+    wifi_config.sta.pmf_cfg.required   = false;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "[WiFi] Connecting to '%s'…", WIFI_SSID);
+    ESP_LOGI(TAG, "[WiFi] Connecting to '%s'...", WIFI_SSID);
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(
@@ -165,7 +143,9 @@ static bool wifi_init_and_wait(void)
     return true;
 }
 
-// ── MQTT callback ─────────────────────────────────────────────────────────────
+// =============================================================================
+// MQTT Callback
+// =============================================================================
 static void onMessage(std::string topic, std::string payload)
 {
     if (topic != TOPIC_MOTOR_ANGLES) return;
@@ -189,80 +169,81 @@ static void onMessage(std::string topic, std::string payload)
     portEXIT_CRITICAL(&s_angle_mux);
 
     xEventGroupSetBits(s_ctrl_events, TARGET_READY_BIT);
-
     ESP_LOGI(TAG, "[MQTT] New target → J1:%.1f°  J2:%.1f°  J3:%.1f°  J4:%.1f°",
              tmp.j1, tmp.j2, tmp.j3, tmp.j4);
 }
 
-// ── Hardware init task (CPU1) ─────────────────────────────────────────────────
-#define HW_READY_BIT  BIT1
-#define HW_FAIL_BIT   BIT2
-
-struct HwBundle {
-    StepperMotor*  s1;
-    StepperMotor*  s2;
-    HBridge*       dc1;
-    HBridge*       dc2;
-    Encoders*      enc;
-    PIDController* pid_j1;
-    PIDController* pid_j2;
-    PIDController* pid_j3;
-    PIDController* pid_j4;
-    MotorManager*  mgr;
-};
-static HwBundle g_hw = {};
+// =============================================================================
+// Hardware  (global — initialised in hw_init_task)
+// =============================================================================
+static HBridge*  g_dc1  = nullptr;   // J3 — DC Motor 1
+static HBridge*  g_dc2  = nullptr;   // J4 — DC Motor 2
+static Encoders* g_enc  = nullptr;
 
 static void hw_init_task(void* /*arg*/)
 {
-    ESP_LOGI(TAG, "[HW] Hardware init starting on CPU1…");
+    ESP_LOGI(TAG, "[HW] Hardware init starting on CPU1...");
 
-    // Steppers — pass joint label so logs show [J1] and [J2]
-    g_hw.s1 = new StepperMotor(S1_STEP, S1_DIR, S1_EN, -1, "J1");
-    g_hw.s2 = new StepperMotor(S2_STEP, S2_DIR, S2_EN, -1, "J2");
-    g_hw.s1->begin();
-    g_hw.s2->begin();
-    g_hw.s1->enable();
-    g_hw.s2->enable();
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // H-bridges — pass joint label so logs show [J3] and [J4]
+    // ── Shared LEDC timer for both DC motors ──────────────────────────────
     TimerConfig dcTimerCfg = {
         .timer          = LEDC_TIMER_0,
         .frequency      = 25000,
         .bit_resolution = LEDC_TIMER_10_BIT,
         .mode           = LEDC_LOW_SPEED_MODE
     };
-    g_hw.dc1 = new HBridge();
-    g_hw.dc2 = new HBridge();
-    g_hw.dc1->setup(DC1_PINS, DC1_CH, &dcTimerCfg, "J3");
-    vTaskDelay(pdMS_TO_TICKS(10));
-    g_hw.dc2->setup(DC2_PINS, DC2_CH, &dcTimerCfg, "J4");
-    vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Encoders
-    g_hw.enc = new Encoders();
-    g_hw.enc->setup(ENC_J1_SDA, ENC_J1_SCL,
-                    ENC_J2_SDA, ENC_J2_SCL,
-                    ENC_J3_PINS, DEG_PER_EDGE_J3,
-                    ENC_J4_PINS, DEG_PER_EDGE_J4);
+    // ── H-bridge for DC motor 1 (J3) ─────────────────────────────────────
+    g_dc1 = new HBridge();
+    g_dc1->setup(DC1_PINS, DC1_CH, &dcTimerCfg, "J3");
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // PID controllers
-    g_hw.pid_j1 = new PIDController(J1_KP, J1_KI, J1_KD);
-    g_hw.pid_j2 = new PIDController(J2_KP, J2_KI, J2_KD);
-    g_hw.pid_j3 = new PIDController(J3_KP, J3_KI, J3_KD);
-    g_hw.pid_j4 = new PIDController(J4_KP, J4_KI, J4_KD);
+    // ── H-bridge for DC motor 2 (J4) ─────────────────────────────────────
+    g_dc2 = new HBridge();
+    g_dc2->setup(DC2_PINS, DC2_CH, &dcTimerCfg, "J4");
+    vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Motor manager
-    g_hw.mgr = new MotorManager(*g_hw.s1, *g_hw.s2,
-                                 *g_hw.dc1, *g_hw.dc2,
-                                 *g_hw.pid_j1, *g_hw.pid_j2,
-                                 *g_hw.pid_j3, *g_hw.pid_j4,
-                                 MAX_DUTY);
+    // ── Encoders ─────────────────────────────────────────────────────────
+    g_enc = new Encoders();
+    g_enc->setup(ENC_I2C_SDA,  ENC_I2C_SCL,
+                 ENC2_I2C_SDA, ENC2_I2C_SCL,
+                 ENC_J3_PINS,  DEG_PER_EDGE_J3,
+                 ENC_J4_PINS,  DEG_PER_EDGE_J4);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     ESP_LOGI(TAG, "[HW] Hardware ready.");
     xEventGroupSetBits(s_ctrl_events, HW_READY_BIT);
     vTaskDelete(NULL);
+
+    // ── Stepper motor (J1) ────────────────────────────────────────────────
+    Smotor.setup(STEPPERPINS, 0, &timer, step_per_rev);
+    interrupt_pin.setup(INTERRUPT_PIN, GPIO_MODE_INPUT);
+    interrupt_pin.addInterrupt(GPIO_INTR_POSEDGE, &j1_step_handler);
+}
+
+// =============================================================================
+// computeDuty — proportional slowdown, same sign as error
+//
+//   |error| >= SLOW_ZONE               →  sign * maxDuty
+//   |error| in (STOP_ZONE, SLOW_ZONE)  →  linearly scaled minDuty..maxDuty
+//   |error| <= STOP_ZONE               →  0  (stopped)
+//
+// Returned value is SIGNED: positive = spin right, negative = spin left.
+// =============================================================================
+static float computeDuty(float error, float maxDuty, float minDuty)
+{
+    float absErr = (error >= 0.0f) ? error : -error;
+    float sign   = (error >= 0.0f) ? 1.0f : -1.0f;
+
+    if (absErr <= STOP_ZONE) {
+        return 0.0f;                                          // inside dead-band → stop
+    }
+    if (absErr >= SLOW_ZONE) {
+        return sign * maxDuty;                                // far away → full speed
+    }
+    // Linear scale between minDuty and maxDuty inside the slow zone
+    float fraction = (absErr - STOP_ZONE) / (SLOW_ZONE - STOP_ZONE);
+    float duty     = minDuty + fraction * (maxDuty - minDuty);
+    return sign * duty;
 }
 
 // =============================================================================
@@ -293,83 +274,150 @@ extern "C" void app_main(void)
 
     s_ctrl_events = xEventGroupCreate();
 
-    // ── WiFi ─────────────────────────────────────────────────────────────────
+    // ── WiFi ─────────────────────────────────────────────────────────────
     if (!wifi_init_and_wait()) {
         ESP_LOGE(TAG, "[WiFi] No network — halting.");
         vTaskSuspend(NULL);
     }
 
-    // ── MQTT ─────────────────────────────────────────────────────────────────
+    // ── MQTT ─────────────────────────────────────────────────────────────
     MQTTClient mqttClient;
     mqttClient.setCallback(onMessage);
     mqttClient.init(BROKER_URI, BROKER_USER, BROKER_PASS);
 
-    ESP_LOGI(TAG, "[MQTT] Connecting to %s…", BROKER_URI.c_str());
+    ESP_LOGI(TAG, "[MQTT] Connecting to %s...", BROKER_URI.c_str());
     mqttClient.start();
 
     for (int mqttRetry = 0; !mqttClient.isConnected(); ++mqttRetry) {
         vTaskDelay(pdMS_TO_TICKS(500));
         if (mqttRetry % 4 == 0)
-            ESP_LOGI(TAG, "[MQTT] Waiting for broker… (%d s)", mqttRetry / 2);
+            ESP_LOGI(TAG, "[MQTT] Waiting for broker... (%d s)", mqttRetry / 2);
         if (mqttRetry >= 40) {
-            ESP_LOGE(TAG, "[MQTT] Broker unreachable at %s after 20 s. "
-                          "Check IP, port, and that the broker is running.",
+            ESP_LOGE(TAG, "[MQTT] Broker unreachable at %s after 20 s.",
                      BROKER_URI.c_str());
             vTaskSuspend(NULL);
         }
     }
-    ESP_LOGI(TAG, "[MQTT] Connected — listening on '%s'",
-             TOPIC_MOTOR_ANGLES.c_str());
+    ESP_LOGI(TAG, "[MQTT] Connected — listening on '%s'", TOPIC_MOTOR_ANGLES.c_str());
     mqttClient.subscribe(TOPIC_MOTOR_ANGLES);
 
-    // ── Hardware init on CPU1 ─────────────────────────────────────────────────
-    ESP_LOGI(TAG, "[HW] Starting hardware init on CPU1…");
+    // ── Hardware init on CPU1 ─────────────────────────────────────────────
     xTaskCreatePinnedToCore(hw_init_task, "hw_init", 8192, NULL, 5, NULL, 1);
     xEventGroupWaitBits(s_ctrl_events, HW_READY_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
     ESP_LOGI(TAG, "[HW] Hardware ready — entering control loop at 50 Hz");
-    ESP_LOGI(TAG, "[HW] Waiting for first target on '%s'",
-             TOPIC_MOTOR_ANGLES.c_str());
 
     // =========================================================================
     // Control loop — 50 Hz, CPU0
     // =========================================================================
-    TickType_t lastWake = xTaskGetTickCount();
-    const float dt      = LOOP_TICKS / static_cast<float>(configTICK_RATE_HZ);
+    TickType_t lastWake  = xTaskGetTickCount();
+    bool       j3_active = false;   // true while we are driving toward a J3 target
+    bool       j4_active = false;   // true while we are driving toward a J4 target
 
-    while (true) {
-
+    while (true)
+    {
         // 1. Read encoders
-        MotorAngles feedback = g_hw.enc->readAll();
+        MotorAngles feedback = g_enc->readAll();
 
-        // 2. Service stepper acceleration state machines
-        g_hw.s1->update();
-        g_hw.s2->update();
-
-        // 3. Run PID if a target is active
+        // 2. Check whether a target is pending
         EventBits_t bits = xEventGroupGetBits(s_ctrl_events);
-        if (bits & TARGET_READY_BIT) {
+        if (bits & TARGET_READY_BIT)
+        {
             MotorAngles localTarget;
             portENTER_CRITICAL(&s_angle_mux);
             localTarget = s_target;
             portEXIT_CRITICAL(&s_angle_mux);
+            // ── J1 (Stepper Motor 1) ──────────────────────────────────────────────
+            {
+                float error = ShortPath(s_j1_position, localTarget.j1);
+                float rpm   = error;                          // proportional
+                if (rpm >  30.0f) rpm =  30.0f;              // clamp to ±30 RPM
+                if (rpm < -30.0f) rpm = -30.0f;
 
-            // update() returns true when ALL joints are within deadband.
-            // Clear the bit then so the PID loop stops until a new target arrives.
-            bool allDone = g_hw.mgr->update(localTarget, feedback, dt);
-            if (allDone) {
+                s_j1_direction = (rpm > 0.0f);
+
+                if (fabsf(error) <= 1.9f) {
+                    Smotor.setSpeed(0.0f);
+                    ESP_LOGI(TAG, "[J1] Target reached — pos:%.2f°  target:%.2f°",
+                            s_j1_position, localTarget.j1);
+                } else {
+                    Smotor.setSpeed(rpm);
+                    ESP_LOGI(TAG, "[J1] pos:%.2f°  target:%.2f°  error:%.2f°  rpm:%.1f",
+                            s_j1_position, localTarget.j1, error, rpm);
+                }
+            }
+
+            // ── J3 (DC Motor 1) ───────────────────────────────────────────
+            {
+                float error = localTarget.j3 - feedback.j3;
+                float duty  = computeDuty(error, MAX_DUTY_J3, MIN_DUTY_J3);
+
+                if (duty == 0.0f)
+                {
+                    g_dc1->setStop();
+
+                    if (j3_active) {
+                        ESP_LOGI(TAG, "[J3] Target reached — feedback:%.2f°  target:%.2f°",
+                                 feedback.j3, localTarget.j3);
+                        j3_active = false;
+                    }
+                }
+                else
+                {
+                    g_dc1->setDuty(duty);
+                    j3_active = true;
+
+                    ESP_LOGI(TAG, "[J3] target:%.2f°  feedback:%.2f°  error:%.2f°  duty:%.1f%%",
+                             localTarget.j3, feedback.j3, error, duty);
+                }
+            }
+
+            // ── J4 (DC Motor 2) ───────────────────────────────────────────
+            {
+                float error = localTarget.j4 - feedback.j4;
+                float duty  = computeDuty(error, MAX_DUTY_J4, MIN_DUTY_J4);
+
+                if (duty == 0.0f)
+                {
+                    g_dc2->setStop();
+
+                    if (j4_active) {
+                        ESP_LOGI(TAG, "[J4] Target reached — feedback:%.2f°  target:%.2f°",
+                                 feedback.j4, localTarget.j4);
+                        j4_active = false;
+                    }
+                }
+                else
+                {
+                    g_dc2->setDuty(duty);
+                    j4_active = true;
+
+                    ESP_LOGI(TAG, "[J4] target:%.2f°  feedback:%.2f°  error:%.2f°  duty:%.1f%%",
+                             localTarget.j4, feedback.j4, error, duty);
+                }
+            }
+
+            // Clear TARGET_READY_BIT only when BOTH motors have reached their targets
+            if (!j3_active && !j4_active) {
                 xEventGroupClearBits(s_ctrl_events, TARGET_READY_BIT);
-                ESP_LOGI(TAG, "[CTRL] All joints at target — motors idle.");
             }
         }
+        else
+        {
+            // No active target — make sure both motors are stopped
+            g_dc1->setStop();
+            g_dc2->setStop();
+            j3_active = false;
+            j4_active = false;
+        }
 
-        // 4. Publish encoder angles (no terminal log — noisy)
+        // 3. Publish all encoder angles to broker
         cJSON* doc = cJSON_CreateObject();
-        cJSON_AddNumberToObject(doc, "j1", feedback.j1);
-        cJSON_AddNumberToObject(doc, "j2", feedback.j2);
-        cJSON_AddNumberToObject(doc, "j3", feedback.j3);
-        cJSON_AddNumberToObject(doc, "j4", feedback.j4);
-
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.2f", s_j1_position); cJSON_AddRawToObject(doc, "j1", buf);
+        snprintf(buf, sizeof(buf), "%.2f", feedback.j2); cJSON_AddRawToObject(doc, "j2", buf);
+        snprintf(buf, sizeof(buf), "%.2f", feedback.j3); cJSON_AddRawToObject(doc, "j3", buf);
+        snprintf(buf, sizeof(buf), "%.2f", feedback.j4); cJSON_AddRawToObject(doc, "j4", buf);
         char* payload = cJSON_PrintUnformatted(doc);
         if (payload) {
             mqttClient.publish(TOPIC_ENCODERS, std::string(payload));

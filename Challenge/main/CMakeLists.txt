@@ -9,14 +9,13 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
+        Stepper
+        SimpleGPIO
         MotorAngles     # MotorAngles struct
         MqttClient      # MqttClient
         Encoders         # Encoders (AS5600 + QuadratureEncoder)
-        DriverStepper   # StepperMotor
         HBridge          # HBridge
         SimplePWM       # SimplePWM (needed for TimerConfig)
-        PIDcontroller   # PIDController
-        MotorManager    # MotorManager
         freertos         # vTaskDelayUntil
         log          # ESP_LOGI / ESP_LOGE
         json            # cJSON — ESP-IDF built-in

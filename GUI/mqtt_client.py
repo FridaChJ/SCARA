@@ -88,8 +88,8 @@ class MQTTClient:
             self._connected = True
 
             # Subscribe to feedback topic
-            client.subscribe("robot/feedback", qos=0)
-            print("[MQTT] Subscribed to robot/feedback")
+            client.subscribe("robot/encoders", qos=0)
+            print("[MQTT] Subscribed to robot/encoders")
 
         else:
             print(f"[MQTT] Connection failed with code {rc}")
