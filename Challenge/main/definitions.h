@@ -9,6 +9,7 @@
 #include "freertos/event_groups.h"
 #include "driver/gpio.h"
 
+
 //=========================== Wifi Config ===============================
 constexpr const char* WIFI_SSID     = "Friii";      // WiFi ID into which the ESP is going to connect
 constexpr const char* WIFI_PASSWORD = "12345678";   // WiFi password into which the ESP is going to connect
@@ -58,7 +59,7 @@ constexpr float MAX_DUTY = 60.0f; // Maximum duty cycle for DC motors (0–100%)
 #define WIFI_CONNECTED_BIT BIT2  // Set when WiFi is connected
 #define WIFI_FAIL_BIT      BIT3  // Set when WiFi connection fails
 // Hardware init flags
-#define HW_FAIL_BIT        BIT2  // Set if hardware initialization fails
+#define HW_FAIL_BIT        BIT5  // Set if hardware initialization fails
 #define HW_READY_BIT       BIT4  // Set when hardware initialization is successful
 
 #endif // DEFINITIONS_H
