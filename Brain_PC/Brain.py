@@ -96,13 +96,8 @@ def parse_manual_input(line:str, current_angles: dict) -> dict | None:
     except ValueError:
       print(f"[MANUAL] '{raw_value}' is not a valid number for '{key}'")
     
-    new_angle  = current_angles[JOINT_MAP[key]] + delta
-    clamped    = max(ANGLE_MIN, min(ANGLE_MAX, new_angle))
-
-    if clamped != new_angle:
-        print(f"  [Manual] '{key}' clamped: {new_angle:.2f} → {clamped:.2f}")
-
-    updated[JOINT_MAP[key]] = clamped
+    new_angle = current_angles[JOINT_MAP[key]] + delta
+    updated[JOINT_MAP[key]] = new_angle
     parsed_any = True
   return updated if parsed_any else None
 
@@ -159,7 +154,7 @@ def main() -> None:
   global manual_target_angles  # ← add this line
   #Instantiate main classes
   mqtt = MQTTClient(
-    broker_ip            ="192.168.4.87", 
+    broker_ip            ="10.48.231.132", 
     port                 =1883,
     username             ="Friii",
     password             ="12345678",

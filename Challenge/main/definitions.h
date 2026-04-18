@@ -15,7 +15,7 @@ constexpr const char* WIFI_SSID     = "Friii";      // WiFi ID into which the ES
 constexpr const char* WIFI_PASSWORD = "12345678";   // WiFi password into which the ESP is going to connect
 
 //=========================== MQTT Config ===============================
-static const std::string BROKER_URI         = "mqtt://192.168.4.87"; // MQTT broker URI
+static const std::string BROKER_URI         = "mqtt://10.48.231.132"; // MQTT broker URI
 static const std::string BROKER_USER        = "";                     // MQTT broker username
 static const std::string BROKER_PASS        = "";                     // MQTT broker password
 static const std::string TOPIC_MOTOR_ANGLES = "robot/motor_angles";   // Topic that receives angles from PC

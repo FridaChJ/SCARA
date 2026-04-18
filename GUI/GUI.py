@@ -603,7 +603,7 @@ def main():
 
     # ── Create controller NOW that motor_vars exists ──────────────────────
     mqtt_client = MQTTClient(
-        broker_ip="192.168.4.87",
+        broker_ip="10.48.231.132",
         port=1883,
         username="Frii",
         password="12345678",
