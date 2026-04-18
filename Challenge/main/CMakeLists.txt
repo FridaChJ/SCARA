@@ -19,4 +19,5 @@ idf_component_register(
         freertos         # vTaskDelayUntil
         log          # ESP_LOGI / ESP_LOGE
         json            # cJSON — ESP-IDF built-in
+        esp_timer       # esp_timer_get_time
 )

@@ -1,4 +1,4 @@
-#include "SimpleGPIO.h"
+#include "include/SimpleGPIO.h"
 
 SimpleGPIO::SimpleGPIO()
 {
