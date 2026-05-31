@@ -175,7 +175,7 @@ if __name__ == "__main__":
         colour_counter[colour] = colour_counter.get(colour, 0) + 1
         name = f"{colour}{colour_counter[colour]}"
         if angles[name]:
-            fk = robot.forward_kinematics(angles[name]["j1"], angles[name]["j3"])
+            fk = robot.forward_kinematics(angles[name]["j1"], angles[name]["j3"]) # pyright: ignore[reportOptionalSubscript]
             print(
                 f"{name:<10} target=({obj['x']:.2f}, {obj['y']:.2f})  "
                 f"FK=({fk[0]:.2f}, {fk[1]:.2f})  "

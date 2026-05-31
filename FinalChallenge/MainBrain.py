@@ -11,8 +11,9 @@ import subprocess
 #CV
 from CV import process_image
 #Kinematics
-from Kinematics import compute_kinematics
-
+from Kinematics import compute_kinematics # pyright: ignore[reportMissingImports]
+#Controller
+from robot_controller import RobotController   # type: ignore
 # ===========================CONSTANTS=======================================
 # MQTT
 BROKER_IP = "192.168.4.76"
@@ -81,7 +82,7 @@ def run_cv_until_valid(max_attempts=10, delay=2):
         try:
             print(f"[MAIN] CV Processing ({attempt+1}/{max_attempts})...")
 
-            summary_data, coordinates_data = process_image(IMAGE_PATH)
+            summary_data, coordinates_data = process_image(IMAGE_PATH) # type: ignore
 
             # If process_image did NOT raise exception → markers detected
             print("[MAIN] CV successful")
@@ -205,4 +206,9 @@ if __name__ == "__main__":
     print("[MAIN] Kinematics Output:")
     print(angles)
 
-    print("[MAIN] System initialized successfully")
+    #Controller
+    print("[MAIN] Starting movement sequence...")
+    controller = RobotController(mqtt, testing_mode=True)  # testing_mode=False for production
+    controller.run(angles)
+
+    print("[MAIN] System complete.")
