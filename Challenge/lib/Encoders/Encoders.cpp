@@ -45,30 +45,28 @@ void Encoders::setup(gpio_num_t sda,    gpio_num_t scl,
                      uint8_t gpio_j4[2], float degPerEdge_j4)
 {
     // ── AS5600 for J1 ─────────────────────────────────────────────────────
-    _enc_j1 = AS5600_i2c(sda, scl, I2C_NUM_0, ENC_J1_ADDR);
+    _enc_j1.i2c_driver_initialize(sda, scl, I2C_NUM_0);
 
-    // Auto-zero: capture the raw reading right now as the 0° reference
+    // Capture startup position as zero reference
     uint16_t raw = 0;
     esp_err_t err = _enc_j1.read_ANGLE(raw);
-    if (err == ESP_OK) {
-        _offset_j1 = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;
-        _zeroed_j1 = true;
-        ESP_LOGI(TAG, "J1 AS5600 zeroed — offset=%.2f°", _offset_j1);
-    } else {
-        _offset_j1 = 0.0f;
+    if (err == ESP_OK)
+    {
+        _offset_j1  = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;
+        _zeroed_j1  = true;
+        ESP_LOGI(TAG, "AS5600 J1 — zero captured at %.2f°", _offset_j1);
+    }
+    else
+    {
         _zeroed_j1 = false;
-        ESP_LOGE(TAG, "J1 AS5600 zero-read failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "AS5600 J1 — failed to read angle at startup (err %d)", err);
     }
 
     // ── QuadratureEncoder for J3 ──────────────────────────────────────────
     _enc_j3.setup(gpio_j3, degPerEdge_j3);
-    ESP_LOGI(TAG, "Quadrature J3 — A:%d B:%d deg/edge:%.4f",
-             gpio_j3[0], gpio_j3[1], degPerEdge_j3);
 
     // ── QuadratureEncoder for J4 ──────────────────────────────────────────
     _enc_j4.setup(gpio_j4, degPerEdge_j4);
-    ESP_LOGI(TAG, "Quadrature J4 — A:%d B:%d deg/edge:%.4f",
-             gpio_j4[0], gpio_j4[1], degPerEdge_j4);
 }
 
 // =============================================================================
@@ -81,8 +79,8 @@ void Encoders::setup(gpio_num_t sda,    gpio_num_t scl,
 MotorAngles Encoders::readAll()
 {
     MotorAngles angles;
-    angles.j1 = _readAS5600delta(_enc_j1, _offset_j1);
-    angles.j2 = 0.0f;   // J2 supplied by caller from step-math
+    angles.j1 = _readAS5600delta(_enc_j1, _offset_j1);  // real angle from sensor
+    angles.j2 = 0.0f;                                    // J2 from step math (caller fills)
     angles.j3 = _enc_j3.getAngle();
     angles.j4 = _enc_j4.getAngle();
     return angles;
@@ -93,12 +91,7 @@ MotorAngles Encoders::readAll()
 // =============================================================================
 void Encoders::resetZero()
 {
-    uint16_t raw = 0;
-    esp_err_t err = _enc_j1.read_ANGLE(raw);
-    if (err == ESP_OK) {
-        _offset_j1 = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;
-        ESP_LOGI(TAG, "J1 zero re-captured at %.2f°", _offset_j1);
-    }
+    // J1 AS5600 is disabled; J1 position is tracked by the stepper counter.
 }
 
 // =============================================================================
@@ -119,10 +112,13 @@ void Encoders::resetQuadrature()
 // =============================================================================
 float Encoders::_readAS5600delta(AS5600_i2c& enc, float offset)
 {
+    if (!_zeroed_j1) {
+        return 0.0f;
+    }
+
     uint16_t raw = 0;
     esp_err_t err = enc.read_ANGLE(raw);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "AS5600 read failed: %s", esp_err_to_name(err));
         return 0.0f;
     }
 
