@@ -18,6 +18,7 @@ HBridge::HBridge() { _label[0] = '\0'; _stopped = false; }
 void HBridge::setup(uint8_t pin[2], uint8_t ch[2], TimerConfig* config,
                     const char* jointLabel)
 {
+    
     for (size_t i = 0; i < 2; i++)
         pwm[i].setup(pin[i], ch[i], config);
 

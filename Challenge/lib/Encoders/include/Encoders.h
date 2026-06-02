@@ -11,9 +11,6 @@
 #include "MotorAngles.h"
 #include "driver/gpio.h"
 
-// Degrees per raw count from AS5600 (12-bit → 4096 counts per revolution)
-//constexpr float AS5600_DEG_PER_COUNT = 360.0f / 4096.0f;
-
 class Encoders
 {
 public:
@@ -36,16 +33,19 @@ public:
     // Reset quadrature counters for J3 and J4 to zero.
     void resetQuadrature();
 
-private:
-    // ── AS5600 (J1 only) ──────────────────────────────────────────────────
-    AS5600_i2c _enc_j1;
-    float      _offset_j1;   // raw angle captured at startup (= 0° reference)
-    bool       _zeroed_j1;
+    // ── Public accessors for diagnostics ───────────────────────────────────
+    AS5600_i2c _enc_j1;       // AS5600 encoder object
+    float      _offset_j1;    // Captured zero reference
 
+private:
     // ── Quadrature encoders (J3, J4) ──────────────────────────────────────
     QuadratureEncoder _enc_j3;
     QuadratureEncoder _enc_j4;
+    bool       _zeroed_j1;   // false until a successful read_ANGLE at startup
 
-    // Helper: read raw angle, subtract offset, wrap to [-180, +180]
+    // Capture the current AS5600 reading as the J1 zero reference.
+    void  _captureJ1Zero();
+
+    // Read raw angle, subtract offset, wrap to [-180, +180].
     float _readAS5600delta(AS5600_i2c& enc, float offset);
 };

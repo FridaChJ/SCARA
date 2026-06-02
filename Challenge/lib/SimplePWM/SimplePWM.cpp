@@ -22,6 +22,7 @@ void SimplePWM::setup(const uint8_t pin, const uint8_t channel,
     _channel           = (ledc_channel_t)channel;
     _timer_config      = timer_config;
     _max_digital_level = (1 << timer_config->bit_resolution) - 1;
+    //_last_level        = 0xFFFFFFFF;
 
     // Configure the hardware timer only once per unique (timer, mode) pair
     static uint32_t configured_timers = 0;

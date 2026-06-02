@@ -145,12 +145,14 @@ public:
     esp_err_t   read_MAGNITUDE(uint16_t&      magnitude);
     esp_err_t   Burn_Angle    ();
     esp_err_t   Burn_Setting  ();
+    
+    void      i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl,  i2c_port_t port);
+
 
 private:
     i2c_port_t i2c_num;
     uint8_t    i2c_address;
 
-    void      i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl,  i2c_port_t port);
 
     esp_err_t read_registr (AS5600_REG reg, uint8_t*  value, uint8_t len);
     esp_err_t read_registr (AS5600_REG reg, uint16_t& value);

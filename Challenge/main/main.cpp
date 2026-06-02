@@ -31,9 +31,16 @@
 #include <cmath>
 #include "include/Stepper.h"
 #include "SimpleGPIO.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+//#include "driver/i2c_master.h"
+//#include "as5600.h"
+#include "driver/i2c.h"
 
 // =================================GLOBALS=================================
-static const char* TAG = "MAIN";
+//static const char* TAG = "MAIN";
+static const char* TAG = "MotorCtrl";
 static void IRAM_ATTR j1_step_handler(void* arg);
 typedef enum {
     STATE_INIT,
@@ -49,7 +56,7 @@ static float         s_j1_target   = 0.0f;
 static float         s_j3_target   = 0.0f;
 //================Stepper J1
 #define INTERRUPT_PIN   GPIO_NUM_1
-#define STEP_PER_REV    200
+#define STEP_PER_REV    200  // estimated: 200 steps * 16 microsteps
 
 static uint8_t    STEPPERPINS[2]   = {S1_STEP, S1_DIR};
 static TimerConfig s_stepper_timer = {
@@ -74,7 +81,7 @@ static HBridge* g_dc2 = nullptr;   // J4
 
 // =================================FUNCTIONS-STATE-INIT=================================
 //================Init Hardware
-Encoders g_encoders;   // global encoder instance used by init_hardware()
+static Encoders* g_enc  = nullptr;  // global encoder instance used by init_hardware()
 void init_hardware()
 {
     ESP_LOGI(TAG, "=== init_hardware START ===");
@@ -107,7 +114,7 @@ void init_hardware()
     ESP_ERROR_CHECK(gpio_config(&lim_cfg));
     ESP_LOGI(TAG, "Limit switch J2 — GPIO:%d (pull-up, active LOW)", S2_LIMIT_PIN);
 
-    // ── 3. DC motor PWM — LEDC timer 0 @ 20 kHz (J3, J4 H-bridges) ────────
+    /*// ── 3. DC motor PWM — LEDC timer 0 @ 20 kHz (J3, J4 H-bridges) ────────
     ledc_timer_config_t dc_timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = LEDC_TIMER_10_BIT,
@@ -134,13 +141,13 @@ void init_hardware()
         init_dc_channel(DC1_PINS[i], DC1_CH[i]);   // J3
         init_dc_channel(DC2_PINS[i], DC2_CH[i]);   // J4
     }
-    ESP_LOGI(TAG, "DC motors J3/J4 — PWM timer0 @ 20kHz, channels 0-3, duty=0");
-
+    ESP_LOGI(TAG, "DC motors J3/J4 — PWM timer0 @ 20kHz, channels 0-3, duty=0");*/
     // ── 4. Gripper servo — LEDC timer 1 @ 50 Hz (separate timer, DC motors ─
     //       run at 20 kHz on timer 0 — servo needs its own timer)
-    ledc_timer_config_t servo_timer = {
+    /*ledc_timer_config_t servo_timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_14_BIT,   // 16383 steps — enough for µs servo control        .timer_num       = LEDC_TIMER_1,
+        .duty_resolution = LEDC_TIMER_14_BIT,   // 16383 steps — enough for µs servo control 
+        .timer_num       = LEDC_TIMER_1,       .timer_num       = LEDC_TIMER_1,
         .freq_hz         = SERVO_FREQ_HZ,        // 50 Hz
         .clk_cfg         = LEDC_AUTO_CLK
     };
@@ -157,9 +164,10 @@ void init_hardware()
     };
     ESP_ERROR_CHECK(ledc_channel_config(&servo_ch));
     ESP_LOGI(TAG, "Gripper servo — GPIO:%d LEDC timer1 @ 50Hz ch4", SERVO_PIN);
-
+*/
     // ── 5. Encoders (AS5600 J1 on I2C0, quadrature J3+J4) ──────────────────
-    g_encoders.setup(
+    g_enc = new Encoders();
+    g_enc->setup(
         ENC_I2C_SDA,  ENC_I2C_SCL,      // J1 AS5600  (I2C port 0)
         ENC2_I2C_SDA, ENC2_I2C_SCL,     // J2 unused  (kept for API compat)
         ENC_J3_PINS,  DEG_PER_EDGE_J3,  // J3 quadrature
@@ -167,7 +175,7 @@ void init_hardware()
     );
     ESP_LOGI(TAG, "Encoders initialised");
     // ── 6. DC motors (HBridge) ────────────────────────────────────────────
-    TimerConfig dcTimerCfg = {
+    static TimerConfig dcTimerCfg = {
         .timer          = LEDC_TIMER_0,
         .frequency      = 25000,
         .bit_resolution = LEDC_TIMER_10_BIT,
@@ -290,7 +298,7 @@ bool parse_message()
 }
 
 // =================================FUNCTIONS-STATE-EXECUTE-CYCLE=================================
-//================J1 step ISR 
+//================J1 step 
 static void IRAM_ATTR j1_step_handler(void* arg)
 {
     float step_deg = 360.0f / STEP_PER_REV;
@@ -321,7 +329,7 @@ static float computeDuty(float error, float maxDuty, float minDuty)
 bool move_to_pickup(float j1_target, float j3_target)
 {
     //Read current positions
-    MotorAngles feedback = g_encoders.readAll();
+    MotorAngles feedback = g_enc->readAll();
     float       j1_current = s_j1_position;   // stepper tracked by ISR
     float       j3_current = feedback.j3;     // quadrature encoder
 
@@ -424,12 +432,165 @@ bool execute_cycle(std::string color, float j1_target, float j3_target)
 // =================================TEST================================
 void test_encoders()
 {
-    MotorAngles angles = g_encoders.readAll();
+    // Read raw AS5600 value for diagnostics
+    uint16_t raw = 0;
+    g_enc->_enc_j1.read_ANGLE(raw);
+    float raw_deg = static_cast<float>(raw) * (360.0f / 1706.0f);
+    
+    MotorAngles angles = g_enc->readAll();
 
     ESP_LOGI(TAG, "──────────────────────────────────────────");
-    ESP_LOGI(TAG, "  J1 (AS5600)      : %.2f°", angles.j1);    ESP_LOGI(TAG, "  J3 (quadrature)  : %.2f°", angles.j3);
+    ESP_LOGI(TAG, "  AS5600 RAW       : %u (%.2f°)", raw, raw_deg);
+    //ESP_LOGI(TAG, "  AS5600 offset    : %.2f°", g_encoders._offset_j1);
+    ESP_LOGI(TAG, "  J1 (delta)       : %.2f°", angles.j1);    
+    ESP_LOGI(TAG, "  J3 (quadrature)  : %.2f°", angles.j3);
     ESP_LOGI(TAG, "  J4 (quadrature)  : %.2f°", angles.j4);
     ESP_LOGI(TAG, "──────────────────────────────────────────");
+}
+
+void i2c_scan()
+{
+    ESP_LOGI(TAG, "=== I2C Scan on SDA:%d SCL:%d ===", ENC_I2C_SDA, ENC_I2C_SCL);
+
+    // ── Re-init only if not already installed ─────────────────────────────
+    // init_hardware() already called i2c_driver_initialize(), so we just
+    // use the existing driver directly.
+    int found = 0;
+    for (uint8_t addr = 0x01; addr < 0x7F; addr++)
+    {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+
+        esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+
+        if (err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
+            found++;
+        }
+    }
+
+    if (found == 0)
+        ESP_LOGE(TAG, "  No I2C devices found — check wiring SDA:%d SCL:%d",
+                 ENC_I2C_SDA, ENC_I2C_SCL);
+    else
+        ESP_LOGI(TAG, "  Scan complete — %d device(s) found", found);
+}
+
+//DC motor control test (J3)
+static constexpr float DEAD_BAND_DEG   =  1.5f;   // stop when |error| < this
+static constexpr float DECEL_START_DEG = 15.0f;   // begin ramp-down inside this window
+
+void moveJ3ToAngle(HBridge&           bridge,std::function<float()> getAngle,float              targetDeg,uint32_t           pollMs = 20)
+{
+    ESP_LOGI(TAG, "moveJ3ToAngle → target: %.2f°", targetDeg);
+
+    while (true)
+    {
+        float current = getAngle();
+        float error   = targetDeg - current;
+
+        ESP_LOGI(TAG, "  current: %.2f°  error: %.2f°", current, error);
+
+        // ── 1. Stop condition ────────────────────────────────────────────────
+        if (fabsf(error) < DEAD_BAND_DEG)
+        {
+            bridge.setStop();
+            ESP_LOGI(TAG, "  Target reached — STOP");
+            break;
+        }
+
+        // ── 2. Deceleration ramp ─────────────────────────────────────────────
+        // Inside DECEL_START_DEG the duty scales linearly from DUTY_MAX → DUTY_MIN
+        float abserr = fabsf(error);
+        float duty;
+        if (abserr >= DECEL_START_DEG)
+        {
+            duty = MAX_DUTY_J3;
+        }
+        else
+        {
+            // Linear interpolation: full speed → min speed over the window
+            float t = abserr / DECEL_START_DEG;          // 1.0 far, 0.0 at target
+            duty = MIN_DUTY_J3 + t * (MAX_DUTY_J3 - MIN_DUTY_J3);
+        }
+
+        // ── 3. Direction ─────────────────────────────────────────────────────
+        // setDuty() in your HBridge: negative → FWD, positive → REV
+        // Flip the sign below if your encoder counts in the opposite direction.
+        float signedDuty = (error > 0) ? -duty : duty;
+        bridge.setDuty(signedDuty);
+
+        vTaskDelay(pdMS_TO_TICKS(pollMs));
+    }
+}
+
+#include "driver/uart.h"
+#define UART_PORT UART_NUM_0
+
+void readAngleFromUART(float& result)
+{
+    char buf[32] = {};
+    int  idx     = 0;
+
+    while (true)
+    {
+        uint8_t c = 0;
+        // Read one byte directly from the UART hardware register — no driver needed
+        if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(100)) > 0)
+        {
+            if (c == '\n' || c == '\r')
+            {
+                if (idx > 0) break;          // got a full line
+            }
+            else if (idx < (int)sizeof(buf) - 1)
+            {
+                buf[idx++] = (char)c;
+                printf("%c", c);             // echo the character back
+                fflush(stdout);
+            }
+        }
+    }
+
+    buf[idx] = '\0';
+    char* end = nullptr;
+    float val = strtof(buf, &end);
+    result = (end != buf) ? val : 0.0f;     // fallback to 0 if parse fails
+    printf("\n");
+}
+static void controlDcJoint(const char* tag,
+                            HBridge*    motor,
+                            float       target,
+                            float       feedback,
+                            float       max_duty,
+                            float       min_duty,
+                            bool*       active)
+{
+    float error = target - feedback;
+    float duty  = computeDuty(error, max_duty, min_duty);
+
+    if (duty == 0.0f)
+    {
+        motor->setStop();
+
+        if (*active) {
+            ESP_LOGI(tag, "[%s] Target reached — feedback:%.2f°  target:%.2f°",
+                     tag, feedback, target);
+            *active = false;
+        }
+    }
+    else
+    {
+        float signedDuty = -duty;
+        motor->setDuty(duty);
+        *active = true;
+
+        ESP_LOGI(tag, "[%s] target:%.2f°  feedback:%.2f°  error:%.2f°  duty:%.1f%%",
+                 tag, target, feedback, error, duty);
+    }
 }
 
 // ===========================================================================
@@ -475,17 +636,44 @@ void test_encoders()
         vTaskDelay(pdMS_TO_TICKS(10));   // yield to FreeRTOS — never busy-spin
     }
 }*/
+
+static EventGroupHandle_t s_ctrl_events = nullptr;
+static portMUX_TYPE       s_angle_mux   = portMUX_INITIALIZER_UNLOCKED;
+
+
 extern "C" void app_main(void)
 {
     vTaskDelay(pdMS_TO_TICKS(1500));
     init_hardware();
+    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
 
-    ESP_LOGI(TAG, "=== ENCODER TEST MODE — move joints by hand ===");
-    ESP_LOGI(TAG, "=== Reading every 500 ms ===");
+    bool j3_active = false;
 
     while (true)
     {
-        test_encoders();
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // ── 1. Ask user for a target angle via Device Monitor ──────────
+        float targetAngle = 0.0f;
+        printf("\nEnter target angle for J3 (degrees): ");
+        fflush(stdout);
+        readAngleFromUART(targetAngle);
+        printf("Moving J3 to %.2f°\n", targetAngle);
+        j3_active = true;
+
+        // ── 2. Control loop: run until motor reaches target ────────────
+        while (j3_active)
+        {
+            MotorAngles feedback = g_enc->readAll();
+
+            controlDcJoint("J3", g_dc1,
+                           targetAngle,   // target
+                           feedback.j3,   // current position
+                           MAX_DUTY_J3, MIN_DUTY_J3,
+                           &j3_active);   // set to false when reached
+
+            vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz control loop
+        }
+
+        printf("[J3] Reached %.2f° — ready for next command.\n", targetAngle);
     }
 }
+

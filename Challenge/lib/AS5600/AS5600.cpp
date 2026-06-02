@@ -3,16 +3,22 @@
 
 static const char* TAG = "AS5600";
 static bool i2c_initialized[2] = {false, false};
+
 // =============================================================================
 // i2c_driver_initialize
 // =============================================================================
-void AS5600_i2c::i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl,  i2c_port_t i2c_num)
+void AS5600_i2c::i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl, i2c_port_t port)
 {
+    // BUG FIX: store the port on the object so that subsequent read/write calls
+    // use the correct I2C peripheral.  Previously the parameter name shadowed
+    // the member, leaving this->i2c_num unchanged.
+    this->i2c_num = port;
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-    if (i2c_initialized[i2c_num]) 
+    if (i2c_initialized[port])
     {
-        ESP_LOGW("AS5600", "I2C port %d already initialized, skipping", i2c_num);
+        ESP_LOGW(TAG, "I2C port %d already initialized, skipping", port);
         return;
     }
     i2c_config_t i2c_config = {
@@ -25,15 +31,15 @@ void AS5600_i2c::i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl,  i2c_port
     };
 #pragma GCC diagnostic pop
 
-    ESP_ERROR_CHECK(i2c_param_config(i2c_num, &i2c_config));
+    ESP_ERROR_CHECK(i2c_param_config(port, &i2c_config));
 
-    esp_err_t err = i2c_driver_install(i2c_num, I2C_MODE_MASTER, 0, 0, 0);
+    esp_err_t err = i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
         ESP_ERROR_CHECK(err);
 
-    ESP_LOGI(TAG, "I2C port %d — SDA:%d SCL:%d addr:0x%02X @ %d Hz",
-             i2c_num, sda, scl, i2c_address, I2C_SPEED_HZ);
-    i2c_initialized[i2c_num] = true;
+    i2c_initialized[port] = true;
+    ESP_LOGI(TAG, "I2C port %d initialised — SDA:%d SCL:%d addr:0x%02X @ %d Hz",
+             port, sda, scl, i2c_address, I2C_SPEED_HZ);
 }
 
 // =============================================================================
@@ -43,10 +49,10 @@ esp_err_t AS5600_i2c::read_registr(AS5600_REG reg, uint8_t* value, uint8_t len)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, i2c_address << 1 | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (i2c_address << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, (uint8_t)reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, i2c_address << 1 | I2C_MASTER_READ, true);
+    i2c_master_start(cmd);   // repeated start
+    i2c_master_write_byte(cmd, (i2c_address << 1) | I2C_MASTER_READ, true);
     if (len > 1)
         i2c_master_read(cmd, value, len, I2C_MASTER_LAST_NACK);
     else
@@ -62,7 +68,7 @@ esp_err_t AS5600_i2c::read_registr(AS5600_REG reg, uint16_t& value)
     uint8_t data[2] = {0, 0};
     esp_err_t err = read_registr(reg, data, 2);
     if (err == ESP_OK)
-        value = ((uint16_t)data[0] << 8) | data[1];
+        value = ((uint16_t)data[0] << 8) | data[1];   // AS5600 sends MSB first
     return err;
 }
 
@@ -75,8 +81,8 @@ esp_err_t AS5600_i2c::write_registr(AS5600_REG reg, uint8_t* value, uint8_t len)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, i2c_address << 1 | I2C_MASTER_WRITE, false);
-    i2c_master_write_byte(cmd, (uint8_t)reg, false);
+    i2c_master_write_byte(cmd, (i2c_address << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (uint8_t)reg, true);
     i2c_master_write(cmd, value, len, true);
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(i2c_num, cmd, pdMS_TO_TICKS(1000));
@@ -86,7 +92,11 @@ esp_err_t AS5600_i2c::write_registr(AS5600_REG reg, uint8_t* value, uint8_t len)
 
 esp_err_t AS5600_i2c::write_registr(AS5600_REG reg, uint16_t value)
 {
-    return write_registr(reg, (uint8_t*)&value, 2);
+    // BUG FIX: AS5600 expects big-endian (MSB first).
+    // Casting a uint16_t pointer directly would send the low byte first on
+    // little-endian ESP32, corrupting every 16-bit write (ZPOS, MPOS, MANG, CONF).
+    uint8_t buf[2] = { (uint8_t)(value >> 8), (uint8_t)(value & 0xFF) };
+    return write_registr(reg, buf, 2);
 }
 
 esp_err_t AS5600_i2c::write_registr(AS5600_REG reg, uint8_t value)
@@ -115,7 +125,10 @@ esp_err_t AS5600_i2c::read_STATUS(AS5600_STATUS& status)
     { return read_registr(AS5600_REG_STATUS, *(uint8_t*)&status); }
 
 esp_err_t AS5600_i2c::write_CONF(AS5600_CONF conf)
-    { return write_registr(AS5600_REG_CONF, *(uint16_t*)&conf); }
+{
+    // Use the corrected big-endian write path (via uint16_t overload)
+    return write_registr(AS5600_REG_CONF, *(uint16_t*)&conf);
+}
 
 AS5600_CONF AS5600_i2c::read_CONF(esp_err_t& err)
 {

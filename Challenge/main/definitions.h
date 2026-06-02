@@ -44,11 +44,13 @@ constexpr int SERVO_CLOSE_US = 2000;                         // Pulse width for 
 // Absolute encoders (AS5600)
 constexpr gpio_num_t ENC_I2C_SDA  = GPIO_NUM_8,  ENC_I2C_SCL  = GPIO_NUM_9;   // J1 I2C encoder pins
 constexpr gpio_num_t ENC2_I2C_SDA = GPIO_NUM_46, ENC2_I2C_SCL = GPIO_NUM_48;   //(unused — J2 uses step math)
-
+#define I2C_FREQ_HZ     100000 
 // Quadrature encoders Q
 static uint8_t ENC_J3_PINS[2] = {14,  15};   // Joint 3 quadrature encoder pins
 static uint8_t ENC_J4_PINS[2] = {36,  39};   // Joint 4 quadrature encoder pins
-constexpr float DEG_PER_EDGE_J3 = 0.1696f;   // Degrees per encoder edge for joint 3
+// Joint 3 has a 2:1 mechanical ratio (encoder turns twice per joint turn).
+// Adjust degrees-per-edge accordingly by dividing by the gear ratio.
+constexpr float DEG_PER_EDGE_J3 = 0.1696f / 2.0f;   // Corrected for 2:1 mechanics
 constexpr float DEG_PER_EDGE_J4 = 0.1098f;   // Degrees per encoder edge for joint 4
 
 //============================ PID Gains ===============================
@@ -59,18 +61,18 @@ constexpr float J4_KP = 1.0f, J4_KI = 0.0f, J4_KD = 0.0f; // Joint 4 PID gains
 
 //============================ Motor Limits ===============================
 static constexpr float MAX_DUTY_J3 = 60.0f;
-static constexpr float MIN_DUTY_J3 = 20.0f;
+static constexpr float MIN_DUTY_J3 = 38.0f;
 static constexpr float MAX_DUTY_J4 = 60.0f;
 static constexpr float MIN_DUTY_J4 = 20.0f;
-static constexpr float SLOW_ZONE   = 15.0f;
-static constexpr float STOP_ZONE   =  1.5f;
+static constexpr float SLOW_ZONE   = 3.0f;
+static constexpr float STOP_ZONE   =  6.0f;
 //============================ Event Bits ===============================
-// WiFi
-#define TARGET_READY_BIT   BIT0  // Set when a new target is received from MQTT
+/*// WiFi
+define TARGET_READY_BIT   BIT0  // Set when a new target is received from MQTT
 #define WIFI_CONNECTED_BIT BIT2  // Set when WiFi is connected
 #define WIFI_FAIL_BIT      BIT3  // Set when WiFi connection fails
 // Hardware init flags
 #define HW_FAIL_BIT        BIT5  // Set if hardware initialization fails
 #define HW_READY_BIT       BIT4  // Set when hardware initialization is successful
-
+*/
 #endif // DEFINITIONS_H
