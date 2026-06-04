@@ -12,28 +12,28 @@ void Stepper::setup(uint8_t pins[2], uint8_t pwm_channel, TimerConfig* timer_con
     step.setDuty(0);
 }
 
+// Stepper.cpp — fix order
 void Stepper::setSpeed(float rpm)
 {
     if (rpm > 0)
-    {
         dir.set(1);
-        printf("Direction set to %s\n", dir.get() ? "TRUE" : "FALSE");
-    }
     else
-    {
         dir.set(0);
-        printf("Direction set to %s\n", dir.get() ? "TRUE" : "FALSE");
-    }
-    int32_t freq = fabs(rpm) * (float)_step_per_rev/60.0f;
+
+    printf("Direction set to %s\n", dir.get() ? "TRUE" : "FALSE");
+
+    int32_t freq = fabs(rpm) * (float)_step_per_rev / 60.0f;
+
     if (freq < 4)
+    {
         step.setDuty(0);
+    }
     else
     {
-        step.setDuty(10);
-        step.setFrequency(freq);
+        step.setFrequency(freq);  // ← FIRST
+        step.setDuty(0.5f);         // ← SECOND
     }
 }
-
 bool Stepper::directionget()
 {
     return dir.get();

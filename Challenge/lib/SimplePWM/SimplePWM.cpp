@@ -83,8 +83,9 @@ void SimplePWM::setDigitalLevel(uint32_t digital_level, uint32_t hpoint)
 
 void SimplePWM::setDuty(float duty_percentage)
 {
+    // Accept 0.0–1.0 range instead of 0–100
     uint32_t digital_level =
-        (uint32_t)(duty_percentage * _max_digital_level / 100.0f);
+        (uint32_t)(duty_percentage * _max_digital_level);
     setDigitalLevel(digital_level, 0);
 }
 

@@ -11,11 +11,11 @@
 
 
 //=========================== Wifi Config ===============================
-constexpr const char* WIFI_SSID     = "Friii";      // WiFi ID into which the ESP is going to connect
-constexpr const char* WIFI_PASSWORD = "12345678";   // WiFi password into which the ESP is going to connect
+constexpr const char* WIFI_SSID     = "GalaxyS23";      // WiFi ID into which the ESP is going to connect
+constexpr const char* WIFI_PASSWORD = "mazapan16";   // WiFi password into which the ESP is going to connect
 
 //=========================== MQTT Config ===============================
-static const std::string BROKER_URI         = "mqtt://10.48.4.76"; // MQTT broker URI
+static const std::string BROKER_URI         = "mqtt://10.48.231.216:1883"; // MQTT broker URI
 static const std::string BROKER_USER        = "";                     // MQTT broker username
 static const std::string BROKER_PASS        = "";                     // MQTT broker password
 static const std::string TOPIC_MOTOR_ANGLES = "angles/response";   // Topic that receives angles from PC
@@ -24,13 +24,14 @@ static const std::string TOPIC_SYSTEM_STATUS = "system/status";     // Topic tha
 //========================= Pin Definitions ===============================
 
 // Stepper motors
-constexpr int S1_STEP = 0, S1_DIR = 0;                  // Joint 1 stepper motor pins (EN always on, not connected)
-constexpr int S2_STEP = 4,   S2_DIR = 5;                    // Joint 2 stepper motor pins (EN always on, not connected)
-constexpr int S2_LIMIT_PIN = 7;                              // GPIO for J2 limit switch (active LOW, internal pull-up)
+constexpr int S1_STEP = 37, S1_DIR = 38;                  // Joint 1 stepper motor pins (EN always on, not connected)
+constexpr int S2_STEP = 47   ,   S2_DIR = 48;                    // Joint 2 stepper motor pins (EN always on, not connected)
+constexpr int S2_LIMIT_PIN = 20;                              // GPIO for J2 limit switch (active LOW, internal pull-up)
+constexpr int INTERRUPT_PIN = 21;
 
 // DC motors
 static uint8_t DC1_PINS[2] = {10, 11};  // Joint 3 H-bridge pins
-static uint8_t DC1_CH[2]   = {0,  1};   // Joint 3 PWM channels
+static uint8_t DC1_CH[2]   = {4,  5};   // Joint 3 PWM channels
 static uint8_t DC2_PINS[2] = {12, 13};  // Joint 4 H-bridge pins
 static uint8_t DC2_CH[2]   = {2,  3};   // Joint 4 PWM channels
 
@@ -44,7 +45,7 @@ constexpr int SERVO_CLOSE_US = 2000;                         // Pulse width for 
 // Absolute encoders (AS5600)
 constexpr gpio_num_t ENC_I2C_SDA  = GPIO_NUM_8,  ENC_I2C_SCL  = GPIO_NUM_9;   // J1 I2C encoder pins
 constexpr gpio_num_t ENC2_I2C_SDA = GPIO_NUM_46, ENC2_I2C_SCL = GPIO_NUM_48;   //(unused — J2 uses step math)
-#define I2C_FREQ_HZ     100000 
+                            //#define I2C_FREQ_HZ     100000 
 // Quadrature encoders Q
 static uint8_t ENC_J3_PINS[2] = {14,  15};   // Joint 3 quadrature encoder pins
 static uint8_t ENC_J4_PINS[2] = {36,  39};   // Joint 4 quadrature encoder pins
@@ -60,12 +61,12 @@ constexpr float J3_KP = 1.0f, J3_KI = 0.0f, J3_KD = 0.0f; // Joint 3 PID gains
 constexpr float J4_KP = 1.0f, J4_KI = 0.0f, J4_KD = 0.0f; // Joint 4 PID gains
 
 //============================ Motor Limits ===============================
-static constexpr float MAX_DUTY_J3 = 60.0f;
-static constexpr float MIN_DUTY_J3 = 38.0f;
-static constexpr float MAX_DUTY_J4 = 60.0f;
-static constexpr float MIN_DUTY_J4 = 20.0f;
-static constexpr float SLOW_ZONE   = 3.0f;
-static constexpr float STOP_ZONE   =  6.0f;
+static constexpr float MAX_DUTY_J3 = 0.60f;
+static constexpr float MIN_DUTY_J3 = 0.70f;
+static constexpr float MAX_DUTY_J4 = 0.60f;
+static constexpr float MIN_DUTY_J4 = 0.20f;
+static constexpr float SLOW_ZONE   = 6.0f;
+static constexpr float STOP_ZONE   =  3.0f;
 //============================ Event Bits ===============================
 /*// WiFi
 define TARGET_READY_BIT   BIT0  // Set when a new target is received from MQTT
@@ -75,4 +76,8 @@ define TARGET_READY_BIT   BIT0  // Set when a new target is received from MQTT
 #define HW_FAIL_BIT        BIT5  // Set if hardware initialization fails
 #define HW_READY_BIT       BIT4  // Set when hardware initialization is successful
 */
+// Event group bits
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT       BIT1
+#define WIFI_MAX_RETRIES    5
 #endif // DEFINITIONS_H

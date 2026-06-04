@@ -41,7 +41,8 @@ private:
     // ── Quadrature encoders (J3, J4) ──────────────────────────────────────
     QuadratureEncoder _enc_j3;
     QuadratureEncoder _enc_j4;
-    bool       _zeroed_j1;   // false until a successful read_ANGLE at startup
+    bool       _zeroed_j1;       // false until a successful read at startup
+    uint16_t   _last_valid_j1_raw;  // Cache of last successful AS5600 raw read
 
     // Capture the current AS5600 reading as the J1 zero reference.
     void  _captureJ1Zero();

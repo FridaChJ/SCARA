@@ -30,7 +30,7 @@ static const char* TAG = "Encoders";
 // Constructor
 // =============================================================================
 Encoders::Encoders()
-    : _offset_j1(0.0f), _zeroed_j1(false)
+    : _offset_j1(0.0f), _zeroed_j1(false), _last_valid_j1_raw(0)
 {}
 
 // =============================================================================
@@ -43,12 +43,19 @@ void Encoders::setup(gpio_num_t sda,      gpio_num_t scl,
                      uint8_t gpio_j3[2],  float degPerEdge_j3,
                      uint8_t gpio_j4[2],  float degPerEdge_j4)
 {
+    ESP_LOGI(TAG, "Encoders::setup() — initializing I2C and AS5600...");
+    
     // ── AS5600 for J1 ─────────────────────────────────────────────────────
     // i2c_driver_initialize now correctly stores i2c_num on the object before
     // the first read_ANGLE call below.
+    ESP_LOGI(TAG, "  Initializing I2C on SDA:%d SCL:%d", sda, scl);
     _enc_j1.i2c_driver_initialize(sda, scl, I2C_NUM_0);
 
+    // ── Small delay to let I2C settle ──────────────────────────────────────
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     // Capture startup position as the zero reference for J1.
+    ESP_LOGI(TAG, "  Capturing J1 zero reference...");
     _captureJ1Zero();
 
     // ── QuadratureEncoder for J3 ──────────────────────────────────────────
@@ -56,6 +63,8 @@ void Encoders::setup(gpio_num_t sda,      gpio_num_t scl,
 
     // ── QuadratureEncoder for J4 ──────────────────────────────────────────
     _enc_j4.setup(gpio_j4, degPerEdge_j4);
+    
+    ESP_LOGI(TAG, "Encoders::setup() — COMPLETE");
 }
 
 // =============================================================================
@@ -100,30 +109,45 @@ void Encoders::resetQuadrature()
 // _captureJ1Zero  (private)
 //   Reads the current AS5600 angle and stores it as _offset_j1.
 //   Sets _zeroed_j1 = true on success, false on I2C failure.
+//   Includes 3 retry attempts in case of I2C glitches at startup.
 // =============================================================================
 void Encoders::_captureJ1Zero()
 {
     uint16_t raw = 0;
-    esp_err_t err = _enc_j1.read_ANGLE(raw);
-    if (err == ESP_OK)
+    esp_err_t err = ESP_FAIL;
+    
+    // Try up to 3 times with 50ms delay between attempts
+    for (int attempt = 1; attempt <= 3; attempt++)
     {
-        _offset_j1 = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;
-        _zeroed_j1 = true;
-        ESP_LOGI(TAG, "AS5600 J1 — zero captured at %.2f°", _offset_j1);
+        err = _enc_j1.read_RAWANGLE(raw);  // ← Use RAWANGLE, not ANGLE
+        if (err == ESP_OK)
+        {
+            _offset_j1 = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;
+            _zeroed_j1 = true;
+            ESP_LOGI(TAG, "AS5600 J1 — zero captured at %.2f° (attempt %d/3)", _offset_j1, attempt);
+            return;
+        }
+        
+        if (attempt < 3)
+        {
+            ESP_LOGW(TAG, "AS5600 J1 read attempt %d/3 failed (err 0x%X), retrying...", attempt, err);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
-    else
-    {
-        _zeroed_j1 = false;
-        ESP_LOGE(TAG, "AS5600 J1 — failed to read angle (err 0x%X). "
-                      "Check SDA/SCL wiring and I2C address (0x36).", err);
-    }
+    
+    // All attempts failed
+    _zeroed_j1 = false;
+    ESP_LOGE(TAG, "AS5600 J1 — failed to read angle after 3 attempts (err 0x%X). "
+                  "Check SDA/SCL wiring and I2C address (0x36).", err);
 }
 
 // =============================================================================
 // _readAS5600delta  (private)
 //   Returns the signed angular delta from the stored offset, wrapped to
 //   [-180, +180] using the shortest-arc convention.
-//   Returns 0.0f if the sensor has not been zeroed or an I2C read fails.
+//   Uses RAWANGLE (not ANGLE) for consistency with startup read.
+//   Implements silent retries (no logging) for high-speed reads.
+//   Falls back to cached last-valid reading if I2C fails.
 // =============================================================================
 float Encoders::_readAS5600delta(AS5600_i2c& enc, float offset)
 {
@@ -134,11 +158,24 @@ float Encoders::_readAS5600delta(AS5600_i2c& enc, float offset)
     }
 
     uint16_t raw = 0;
-    esp_err_t err = enc.read_ANGLE(raw);
+    esp_err_t err = ESP_FAIL;
+    
+    // Try up to 2 times (no delay, for high-speed reads)
+    for (int attempt = 1; attempt <= 2; attempt++)
+    {
+        err = enc.read_RAWANGLE(raw);  // ← Use RAWANGLE, not ANGLE
+        if (err == ESP_OK)
+        {
+            _last_valid_j1_raw = raw;  // Cache successful read
+            break;  // Success, exit loop
+        }
+    }
+    
+    // If read failed, use cached value
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "AS5600 J1 read failed (err 0x%X)", err);
-        return 0.0f;
+        raw = _last_valid_j1_raw;  // Fall back to last known good value
+        // Silent failure — no log spam during high-speed operation
     }
 
     float abs_deg = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;  // 0 … 359.91°

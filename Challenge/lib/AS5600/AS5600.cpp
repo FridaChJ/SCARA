@@ -14,11 +14,14 @@ void AS5600_i2c::i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl, i2c_port_
     // the member, leaving this->i2c_num unchanged.
     this->i2c_num = port;
 
+    ESP_LOGI(TAG, "i2c_driver_initialize: port=%d, SDA=%d, SCL=%d, addr=0x%02X",
+             port, sda, scl, i2c_address);
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
     if (i2c_initialized[port])
     {
-        ESP_LOGW(TAG, "I2C port %d already initialized, skipping", port);
+        ESP_LOGW(TAG, "I2C port %d already initialized, skipping re-init", port);
         return;
     }
     i2c_config_t i2c_config = {
@@ -31,15 +34,23 @@ void AS5600_i2c::i2c_driver_initialize(gpio_num_t sda, gpio_num_t scl, i2c_port_
     };
 #pragma GCC diagnostic pop
 
-    ESP_ERROR_CHECK(i2c_param_config(port, &i2c_config));
+    esp_err_t err = i2c_param_config(port, &i2c_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "i2c_param_config failed: 0x%X", err);
+        return;
+    }
 
-    esp_err_t err = i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0);
+    err = i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
-        ESP_ERROR_CHECK(err);
+    {
+        ESP_LOGE(TAG, "i2c_driver_install failed: 0x%X", err);
+        return;
+    }
 
     i2c_initialized[port] = true;
-    ESP_LOGI(TAG, "I2C port %d initialised — SDA:%d SCL:%d addr:0x%02X @ %d Hz",
-             port, sda, scl, i2c_address, I2C_SPEED_HZ);
+    ESP_LOGI(TAG, "✓ I2C port %d INITIALIZED — SDA:%d SCL:%d @ %d Hz",
+             port, sda, scl, I2C_SPEED_HZ);
 }
 
 // =============================================================================
