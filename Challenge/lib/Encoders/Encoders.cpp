@@ -124,6 +124,7 @@ void Encoders::_captureJ1Zero()
         {
             _offset_j1 = static_cast<float>(raw) * AS5600_DEG_PER_COUNT;
             _zeroed_j1 = true;
+            _last_valid_j1_raw = raw;
             ESP_LOGI(TAG, "AS5600 J1 — zero captured at %.2f° (attempt %d/3)", _offset_j1, attempt);
             return;
         }

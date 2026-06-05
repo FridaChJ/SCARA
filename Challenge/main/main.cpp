@@ -26,9 +26,12 @@
 #include "MotorAngles.h"
 #include "HBridge.h"
 #include "SimplePWM.h"
+#include "Gripper.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include <cmath>
+#include <vector>
+#include <sstream>
 #include "include/Stepper.h"
 #include "SimpleGPIO.h"
 #include <stdio.h>
@@ -39,13 +42,8 @@
 #include "driver/i2c.h"
 #include "freertos/event_groups.h"
 // =================================GLOBALS=================================
-//static const char* TAG = "MAIN";
-//static const char* TAG = "MotorCtrl";
-typedef enum {
-    STATE_INIT,
-    STATE_IDLE,
-    STATE_EXECUTE_CYCLE
-} RobotState;
+
+
 //=====Wifi 
 static const char* TAG = "WiFi";
 static EventGroupHandle_t s_wifi_event_group = nullptr;
@@ -58,6 +56,11 @@ static std::string   s_payload     = "";       // ← add this line
 static std::string   s_color       = "";
 static float         s_j1_target   = 0.0f;
 static float         s_j3_target   = 0.0f;
+
+#include "driver/uart.h"
+#define UART_PORT UART_NUM_0
+
+
 //================Stepper J1
 #define STEP_PER_REV    6400  // full microstep resolution for J1 stepper
 
@@ -70,6 +73,31 @@ static TimerConfig s_stepper_timer = {
 };
 static Stepper Smotor;
 
+//================Stepper J2 (Z-Axis / Lead Screw)
+static TimerConfig timer_z = {
+    .timer          = LEDC_TIMER_2, // Usamos el Timer 2 para no chocar con J1 y J3
+    .frequency      = 10000,
+    .bit_resolution = LEDC_TIMER_11_BIT,
+    .mode           = LEDC_LOW_SPEED_MODE
+};
+static Stepper Zmotor;
+static Gripper g_gripper;
+static SimpleGPIO limit_switch;
+static SimpleGPIO interrupt_pin;
+
+// Parámetros Mecánicos J2
+constexpr int32_t J2_STEPS_PER_REV = 1600;
+constexpr float J2_MM_PER_REV = 8.0f;
+constexpr float J2_MM_PER_STEP = J2_MM_PER_REV / (float)J2_STEPS_PER_REV;
+constexpr float Z_LIMIT_TOP = 0.0f;       // HOME
+constexpr float Z_LIMIT_BOTTOM = -90.0f;  // PISO
+
+// Odometría Volátil (ISR)
+volatile int32_t current_z_steps = 0;
+volatile bool current_z_direction = true;
+volatile bool is_homing = false;
+float current_z_position = 0.0f;
+
 //================DC motors
 static HBridge* g_dc1 = nullptr;   // J3
 static HBridge* g_dc2 = nullptr;   // J4
@@ -80,6 +108,12 @@ static HBridge* g_dc2 = nullptr;   // J4
 static float computeDuty(float error, float maxDuty, float minDuty);
 static float clampf(float value, float min_value, float max_value);
 //static SemaphoreHandle_t g_i2c_mutex = nullptr;
+
+//=============Handlers para interrupciones del stepper en Z================
+void IRAM_ATTR step_handler_z(void *arg) {
+    if (current_z_direction) current_z_steps++;
+    else current_z_steps--;
+}
 
 //================================================================================
 //=================================HELPER FUNCTIONS===============================
@@ -180,14 +214,6 @@ static void moveJ3(float delta_angle)
 
 // =================================Move Steppers =================================
 //J1 
-float readEncoderRaw()
-{
-    uint16_t raw = 0;
-    //xSemaphoreTake(g_i2c_mutex, portMAX_DELAY);
-    g_enc->_enc_j1.read_RAWANGLE(raw);
-    //  xSemaphoreGive(g_i2c_mutex);
-    return (raw * 360.0f) / 4096.0f;
-}
 
 static inline float clampf(float value, float min_value, float max_value) {
     if (value < min_value) return min_value;
@@ -197,13 +223,82 @@ static inline float clampf(float value, float min_value, float max_value) {
 
 
 //J2 (uP AND DOWN)
+//J2 (UP AND DOWN)
+bool moveJ2_Z_Axis(float target_mm) {
+    if (!is_homing) {
+        target_mm = clampf(target_mm, Z_LIMIT_BOTTOM, Z_LIMIT_TOP);
+    }
+    
+    ESP_LOGI("J2_Z", "Moviendo eje Z a %.2f mm", target_mm);
 
+    const float Kp = 12.0f;
+    const float MAX_RPM = 150.0f;
+    const float SLOWDOWN_DIST = 3.0f;
+    const float STOP_DEADBAND = 0.05f;
+    const float MIN_STABLE_RPM = 12.0f;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+
+        current_z_position = current_z_steps * J2_MM_PER_STEP;
+        
+        bool switch_is_active = (limit_switch.get() == 0); 
+        float error = target_mm - current_z_position;
+
+        // ── MANEJO DEL LIMIT SWITCH (Polling Seguro) ──
+        if (switch_is_active) {
+            if (is_homing) {
+                Zmotor.setSpeed(0.0f);
+                current_z_steps = 0;
+                current_z_position = 0.0f;
+                is_homing = false;
+                ESP_LOGI("J2_Z", "¡Homing completado! Z = 0.0 mm");
+                return true; 
+            } 
+            else if (error > 0) {
+                Zmotor.setSpeed(0.0f);
+                ESP_LOGW("J2_Z", "Alerta: Switch presionado. Subida bloqueada.");
+                return false; 
+            }
+        }
+
+        // ── Condición de Paro Normal ──
+        if (!is_homing && fabsf(error) <= STOP_DEADBAND) {
+            Zmotor.setSpeed(0.0f);
+            ESP_LOGI("J2_Z", "Target alcanzado: %.2f mm", current_z_position);
+            return true;
+        }
+
+        // ── Cálculo de Velocidad ──
+        float u = Kp * error;
+        if (fabsf(error) < SLOWDOWN_DIST) u *= fabsf(error) / SLOWDOWN_DIST;
+        u = clampf(u, -MAX_RPM, MAX_RPM);
+        
+        if (fabsf(u) < MIN_STABLE_RPM) {
+            u = (u > 0) ? MIN_STABLE_RPM : -MIN_STABLE_RPM;
+        }
+
+        current_z_direction = (u > 0);
+        Zmotor.setSpeed(u);
+    }
+}
+
+// Macros rápidas para facilitar tu programación SCARA
+void Z_home() {
+    is_homing = true;
+    moveJ2_Z_Axis(90.0f); // Forzar la subida al origen
+}
+
+void Z_pick() {
+    moveJ2_Z_Axis(Z_LIMIT_BOTTOM); // Ir al piso
+}
 
 // =================================FUNCTIONS-STATE-INIT=================================
 //================Init Hardware
 
 void init_hardware()
 {
+    gpio_install_isr_service(0); 
     ESP_LOGI(TAG, "=== init_hardware START ===");
 
     // ── 1. Stepper motors J1 + J2 (no EN pin — always enabled via hardware) ─
@@ -259,6 +354,24 @@ void init_hardware()
     // ── 7. Stepper J1 ─────────────────────────────────────────────────────
     Smotor.setup(STEPPERPINS, 0, &s_stepper_timer, STEP_PER_REV);
     ESP_LOGI(TAG, "Stepper J1 ready (6400 microsteps/rev)");
+
+    // ── 8 Stepper J2 (Z-Axis Lead Screw) ──────────────────────────────
+    static uint8_t J2_PINS[2] = {S2_STEP, S2_DIR};
+    Zmotor.setup(J2_PINS, 1, &timer_z, J2_STEPS_PER_REV);
+    gpio_pulldown_dis((gpio_num_t)INTERRUPT_PIN);
+    gpio_pulldown_dis((gpio_num_t)S2_LIMIT_PIN);
+    
+    interrupt_pin.setup(INTERRUPT_PIN, GPIO_MODE_INPUT);
+    interrupt_pin.addInterrupt(GPIO_INTR_POSEDGE, step_handler_z);
+
+    limit_switch.setup(S2_LIMIT_PIN, GPIO_MODE_INPUT);
+
+    // <-- AQUÍ borramos el limit_switch.addInterrupt(...)
+    ESP_LOGI(TAG, "Stepper J2 (Z-Axis) ready");
+
+    // ── 9. Gripper servo (LEDC timer 3, independent of motors) ─────────────
+    ESP_ERROR_CHECK(g_gripper.begin());   // configures LEDC, boots to CLOSED
+    ESP_LOGI(TAG, "Gripper ready");
 
     ESP_LOGI(TAG, "=== init_hardware DONE ===");
 }
@@ -365,12 +478,12 @@ bool wifi_init_sta()
         return true;
     }
 
-    ESP_LOGE(TAG, "Connection failed");
+    ESP_LOGE(TAG, "Connection failed after %d retries", WIFI_MAX_RETRIES);
     return false;
 }
 //==============MQTT
 MQTTClient g_mqtt;
-void init_mqtt()
+bool init_mqtt()
 {
     ESP_LOGI(TAG, "=== init_mqtt START ===");
 
@@ -393,9 +506,14 @@ void init_mqtt()
 
     // ── Block here until broker handshake completes ────────────────────────
     // Logs a warning every 2 s so you can see it waiting on the serial monitor.
-    g_mqtt.waitUntilConnected(2000);
+    if (!g_mqtt.waitUntilConnected(10000, 2000)) {
+        ESP_LOGE(TAG, "Unable to connect to MQTT broker at %s", BROKER_URI.c_str());
+        g_mqtt.stop();
+        return false;
+    }
 
     ESP_LOGI(TAG, "=== init_mqtt DONE ===");
+    return true;
 }
 void subscribe_topics()
 {
@@ -412,130 +530,14 @@ void subscribe_topics()
 
 // =================================FUNCTIONS-STATE-IDLE=================================
 //================Parse Message
-bool parse_message()
-{
-    ESP_LOGI(TAG, "Parsing payload: %s", s_payload.c_str());
-
-    // ── Locate "color" ────────────────────────────────────────────────────
-    // Simple manual parse — no cJSON heap allocation needed for this small payload.
-    auto extract_string = [&](const std::string& key) -> std::string {
-        // Looks for  "key":"value"
-        std::string search = "\"" + key + "\":\"";
-        size_t start = s_payload.find(search);
-        if (start == std::string::npos) return "";
-        start += search.size();
-        size_t end = s_payload.find('"', start);
-        if (end == std::string::npos) return "";
-        return s_payload.substr(start, end - start);
-    };
-
-    auto extract_float = [&](const std::string& key) -> float {
-        std::string search = "\"" + key + "\":";
-        size_t start = s_payload.find(search);
-        if (start == std::string::npos) return NAN;
-        start += search.size();
-        const char* ptr = s_payload.c_str() + start;
-        char* end = nullptr;
-        float val = strtof(ptr, &end);
-        if (end == ptr) return NAN;   // no valid number found
-        return val;
-    };
-
-    std::string color  = extract_string("color");
-    float       j1     = extract_float("j1");
-    float       j3     = extract_float("j3");
-
-    // ── Validate ──────────────────────────────────────────────────────────
-    if (color.empty()) {
-        ESP_LOGW(TAG, "parse_message: missing or invalid 'color' field");
-        return false;
-    }
-    if (std::isnan(j1)) {
-        ESP_LOGW(TAG, "parse_message: missing or invalid 'j1' field");
-        return false;
-    }
-    if (std::isnan(j3)) {
-        ESP_LOGW(TAG, "parse_message: missing or invalid 'j3' field");
-        return false;
-    }
-
-    // ── Commit ────────────────────────────────────────────────────────────
-    s_color     = color;
-    s_j1_target = j1;
-    s_j3_target = j3;
-
-    ESP_LOGI(TAG, "Parsed OK — color:%s  j1:%.2f°  j3:%.2f°",
-             s_color.c_str(), s_j1_target, s_j3_target);
-    return true;
-}
 
 // =================================FUNCTIONS-STATE-EXECUTE-CYCLE=================================
 static volatile bool g_j1_done = false;
 static volatile bool g_j3_done = false;
 
-static void moveJ1ClosedLoop(float delta_angle)
-{
-    const float MAX_RPM        = 18.0f;
-    const float MIN_RPM        = 2.0f;
-    const float SLOWDOWN_ANGLE = 15.0f;
-    const float STOP_DEADBAND  = 1.0f;
 
-    float previous_raw_angle = readEncoderRaw();
-    float current_position   = 0.0f;
-    float target_position    = delta_angle;
 
-    int64_t prev_time = esp_timer_get_time();
-    const int64_t dt_us = 10000;
 
-    ESP_LOGI(TAG, "[J1] start=%.2f° delta=%.2f°", previous_raw_angle, delta_angle);
-
-    while (true)
-    {
-        int64_t now = esp_timer_get_time();
-        if (now - prev_time < dt_us) continue;
-        prev_time = now;
-
-        // ── Update position ───────────────────────────────────────────────
-        float raw  = readEncoderRaw();
-        float step = raw - previous_raw_angle;
-        if      (step >  180.0f) step -= 360.0f;
-        else if (step < -180.0f) step += 360.0f;
-        current_position   += step;
-        previous_raw_angle  = raw;
-
-        float error = target_position - current_position;
-
-        // ── Stop ──────────────────────────────────────────────────────────
-        if (fabsf(error) <= STOP_DEADBAND)
-        {
-            Smotor.setSpeed(0.0f);
-            ESP_LOGI(TAG, "[J1] Done — pos=%.2f° target=%.2f°",
-                     current_position, target_position);
-            return;
-        }
-
-        // ── Speed: full or ramp ───────────────────────────────────────────
-        float rpm;
-        if (fabsf(error) >= SLOWDOWN_ANGLE)
-        {
-            rpm = MAX_RPM;                          // full speed
-        }
-        else
-        {
-            // Linear ramp: MAX_RPM → MIN_RPM as error shrinks to deadband
-            float t = (fabsf(error) - STOP_DEADBAND) / (SLOWDOWN_ANGLE - STOP_DEADBAND);
-            rpm = MIN_RPM + t * (MAX_RPM - MIN_RPM);
-        }
-
-        // Apply direction
-        rpm = (error > 0.0f) ? rpm : -rpm;
-
-        Smotor.setSpeed(-rpm);   // negate for wiring polarity
-
-        ESP_LOGI(TAG, "[J1] pos=%.2f° err=%.2f° rpm=%.2f",
-                 current_position, error, -rpm);
-    }
-}
 
 static void moveJ1OpenLoop(float delta_angle)
 {
@@ -609,697 +611,272 @@ static void taskJ3(void* arg)
     vTaskDelete(NULL);
 }
 
-static void moveJ1J3Parallel(float j1_delta, float j3_delta)
-{
-    g_j1_done = false;
-    g_j3_done = false;
 
-    static float j1_arg, j3_arg;
-    j1_arg = j1_delta;
-    j3_arg = j3_delta;
-
-    ESP_LOGI(TAG, "[PARALLEL] J1=%.2f°  J3=%.2f°", j1_delta, j3_delta);
-
-    xTaskCreate(taskJ1, "J1_task", 4096, &j1_arg, 5, NULL);
-    xTaskCreate(taskJ3, "J3_task", 4096, &j3_arg, 5, NULL);
-
-    while (!g_j1_done || !g_j3_done)
-        vTaskDelay(pdMS_TO_TICKS(10));
-
-    ESP_LOGI(TAG, "[PARALLEL] Both joints reached target.");
-}
-
-
-
-//================Step 2: Lower arm (J2)
-//================Step 3: Close gripper
-//================Step 4:  Raise arm (J2)
-//================Step 5: Move J1 & J3 to place position
-//================Step 6: Lower arm
-//================Step 7: Open gripper
-//================Step 8: Raise arm
-
-//================Execute cycle (called from main loop when in STATE_EXECUTE_CYCLE)
-/*
-bool execute_cycle(std::string color, float j1_target, float j3_target)
-{
-    // Internal step tracker — persists across calls
-    static uint8_t step = 0;
-
-    switch (step)
-    {
-        //Step 1: Move J1 + J3 to pickup position (from MQTT) 
-        case 0:
-            if (move_to_pickup(j1_target, j3_target))
-            {
-                ESP_LOGI(TAG, "[CYCLE] Step 1 done — at pickup position");
-                step = 1;   // advance to next step when ready
-            }
-            return false;
-
-        //Step 2 … N: to be added 
-        // case 1:
-        //     ...
-
-        default:
-            // Cycle complete — reset step counter for next cycle
-            ESP_LOGI(TAG, "[CYCLE] Cycle complete");
-            step = 0;
-            return true;
-    }
-}
-*/
-// =================================TEST================================
-void test_encoders()
-{
-    // Read raw AS5600 value for diagnostics
-    uint16_t raw = 0;
-    g_enc->_enc_j1.read_RAWANGLE(raw);
-    float raw_deg = static_cast<float>(raw) * (360.0f / 4096.0f);  // 12-bit encoder
-    
-    MotorAngles angles = g_enc->readAll();
-
-    ESP_LOGI(TAG, "──────────────────────────────────────────");
-    ESP_LOGI(TAG, "  AS5600 RAW       : %u (%.2f°)", raw, raw_deg);
-    //ESP_LOGI(TAG, "  AS5600 offset    : %.2f°", g_encoders._offset_j1);
-    ESP_LOGI(TAG, "  J1 (delta)       : %.2f°", angles.j1);    
-    ESP_LOGI(TAG, "  J3 (quadrature)  : %.2f°", angles.j3);
-    ESP_LOGI(TAG, "  J4 (quadrature)  : %.2f°", angles.j4);
-    ESP_LOGI(TAG, "──────────────────────────────────────────");
-}
-
-void i2c_scan()
-{
-    ESP_LOGI(TAG, "=== I2C Scan on SDA:%d SCL:%d ===", ENC_I2C_SDA, ENC_I2C_SCL);
-
-    // ── Re-init only if not already installed ─────────────────────────────
-    // init_hardware() already called i2c_driver_initialize(), so we just
-    // use the existing driver directly.
-    int found = 0;
-    for (uint8_t addr = 0x01; addr < 0x7F; addr++)
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(cmd);
-
-        esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
-        i2c_cmd_link_delete(cmd);
-
-        if (err == ESP_OK)
-        {
-            ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
-            found++;
-        }
-    }
-
-    if (found == 0)
-        ESP_LOGE(TAG, "  No I2C devices found — check wiring SDA:%d SCL:%d",
-                 ENC_I2C_SDA, ENC_I2C_SCL);
-    else
-        ESP_LOGI(TAG, "  Scan complete — %d device(s) found", found);
-}
-
-//DC motor control test (J3)
-static constexpr float DEAD_BAND_DEG   =  1.5f;   // stop when |error| < this
-static constexpr float DECEL_START_DEG = 15.0f;   // begin ramp-down inside this window
-
-void moveJ3ToAngle(HBridge&           bridge,std::function<float()> getAngle,float              targetDeg,uint32_t           pollMs = 20)
-{
-    ESP_LOGI(TAG, "moveJ3ToAngle → target: %.2f°", targetDeg);
-
-    while (true)
-    {
-        float current = getAngle();
-        float error   = targetDeg - current;
-
-        ESP_LOGI(TAG, "  current: %.2f°  error: %.2f°", current, error);
-
-        // ── 1. Stop condition ────────────────────────────────────────────────
-        if (fabsf(error) < DEAD_BAND_DEG)
-        {
-            bridge.setStop();
-            ESP_LOGI(TAG, "  Target reached — STOP");
-            break;
-        }
-
-        // ── 2. Deceleration ramp ─────────────────────────────────────────────
-        // Inside DECEL_START_DEG the duty scales linearly from DUTY_MAX → DUTY_MIN
-        float abserr = fabsf(error);
-        float duty;
-        if (abserr >= DECEL_START_DEG)
-        {
-            duty = MAX_DUTY_J3;
-        }
-        else
-        {
-            // Linear interpolation: full speed → min speed over the window
-            float t = abserr / DECEL_START_DEG;          // 1.0 far, 0.0 at target
-            duty = MIN_DUTY_J3 + t * (MAX_DUTY_J3 - MIN_DUTY_J3);
-        }
-
-        // ── 3. Direction ─────────────────────────────────────────────────────
-        // setDuty() in your HBridge: negative → FWD, positive → REV
-        // Flip the sign below if your encoder counts in the opposite direction.
-        float signedDuty = (error > 0) ? -duty : duty;
-        bridge.setDuty(signedDuty);
-
-        vTaskDelay(pdMS_TO_TICKS(pollMs));
-    }
-}
-
-#include "driver/uart.h"
-#define UART_PORT UART_NUM_0
-
-void readAngleFromUART(float& result)
-{
-    char buf[32] = {};
-    int  idx     = 0;
-
-    // Flush stale bytes
-    uint8_t flush;
-    while (uart_read_bytes(UART_NUM_0, &flush, 1, pdMS_TO_TICKS(10)) > 0) {}
-
-    ESP_LOGI(TAG, "Waiting for input...");
-
-    while (idx < (int)sizeof(buf) - 1)
-    {
-        uint8_t c = 0;
-        int got = uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(500)); // 500ms timeout
-
-        if (got <= 0)
-        {
-            // No byte for 500ms — treat as end of input
-            if (idx > 0) break;
-            // Nothing typed yet — keep waiting
-            continue;
-        }
-
-        if (c == '\n' || c == '\r')
-        {
-            if (idx > 0) break;
-            continue;   // skip leading terminators
-        }
-        else if (c == 0x08 || c == 0x7F)  // backspace
-        {
-            if (idx > 0) idx--;
-        }
-        else
-        {
-            buf[idx++] = (char)c;
-            printf("%c", c);
-            fflush(stdout);
-        }
-    }
-
-    buf[idx] = '\0';
-    printf("\n");
-
-    char* end = nullptr;
-    float val = strtof(buf, &end);
-    result = (end != buf) ? val : 0.0f;
-
-    ESP_LOGI(TAG, "UART parsed: '%s' → %.4f", buf, result);
-}
-
-struct AS5600Reading {
-    uint16_t raw;
-    float angle_deg;
-    bool magnet_detected;
-    esp_err_t err;
-};
-/*
-AS5600Reading read_as5600() {
-    AS5600Reading result = {0, 0.0f, false, ESP_OK};
-    
-    // Leer ángulo RAW de 12 bits
-    result.err = g_enc->_enc_j1.read_RAWANGLE(result.raw);
-    if (result.err == ESP_OK) {
-        result.angle_deg = (result.raw * 360.0f) / 4096.0f;
-    } else {
-        ESP_LOGE(TAG, "Error leyendo AS5600 RAWANGLE");
-        return result;
-    }
-    
-    // Leer status del imán
-    AS5600_STATUS status = AS5600_STATUS(0);
-    result.err = g_enc->_enc_j1.read_STATUS(status);
-    result.magnet_detected = status.MagnetDetected();
-    
-    if (!result.magnet_detected) {
-        ESP_LOGW(TAG, "Imán no detectado en AS5600");
-    }
-    
-    return result;
-}
-
-static void debugJ1(void)
-{
-    ESP_LOGI(TAG, "=== DEBUG J1 START ===");
-
-    // ── TEST 1: Can we stop the motor? ────────────────────────────────────
-    ESP_LOGI(TAG, "[TEST 1] Calling setSpeed(0) — motor should NOT move");
-    Smotor.setSpeed(0.0f);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI(TAG, "[TEST 1] Done — did motor move? (check visually)");
-
-    // ── TEST 2: Does the encoder change when motor is stopped? ────────────
-    ESP_LOGI(TAG, "[TEST 2] Encoder stability — 10 readings with motor stopped");
-    for (int i = 0; i < 10; i++) {
-        float r = readEncoderRaw();
-        ESP_LOGI(TAG, "  [%d] raw=%.3f°", i, r);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    // ── TEST 3: Does setSpeed(X) actually spin, and setSpeed(0) stop it? ──
-    ESP_LOGI(TAG, "[TEST 3] setSpeed(5) for 1s, then setSpeed(0)");
-    Smotor.setSpeed(5.0f);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    Smotor.setSpeed(0.0f);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "[TEST 3] Done");
-
-    // ── TEST 4: Does the encoder track motion? ────────────────────────────
-    ESP_LOGI(TAG, "[TEST 4] setSpeed(5) — watch encoder move for 2s");
-    float before = readEncoderRaw();
-    Smotor.setSpeed(5.0f);
-    for (int i = 0; i < 20; i++) {
-        float r = readEncoderRaw();
-        ESP_LOGI(TAG, "  [%d] raw=%.3f°  delta=%.3f°", i, r, r - before);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    Smotor.setSpeed(0.0f);
-    ESP_LOGI(TAG, "[TEST 4] Done — encoder should have changed");
-
-    // ── TEST 5: Wraparound — spin past 0/360 boundary ─────────────────────
-    ESP_LOGI(TAG, "[TEST 5] setSpeed(-5) for 2s — watch for wraparound");
-    before = readEncoderRaw();
-    Smotor.setSpeed(-5.0f);
-    for (int i = 0; i < 20; i++) {
-        float r = readEncoderRaw();
-        ESP_LOGI(TAG, "  [%d] raw=%.3f°  delta=%.3f°", i, r, r - before);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    Smotor.setSpeed(0.0f);
-    ESP_LOGI(TAG, "[TEST 5] Done");
-
-    ESP_LOGI(TAG, "=== DEBUG J1 DONE ===");
-}
-
-static void debugJ1ClosedLoop(float delta_angle)
-{
-    const float Kp             = 0.4f;
-    const float MAX_RPM        = 18.0f;
-    const float MIN_RPM        = 3.0f;
-    const float SLOWDOWN_ANGLE = 8.0f;
-    const float STOP_DEADBAND  = 0.5f;
-    const int   SETTLE_COUNT   = 5;
-
-    float previous_raw_angle = readEncoderRaw();
-    float current_position   = 0.0f;
-    float target_position    = delta_angle;
-    int   settle_counter     = 0;
-    int   iteration          = 0;
-
-    int64_t prev_time = esp_timer_get_time();
-    const int64_t dt_us = 10000;
-
-    ESP_LOGI(TAG, "=== CLOSED LOOP DEBUG ===");
-    ESP_LOGI(TAG, "  initial_raw=%.3f°  target_delta=%.3f°", previous_raw_angle, delta_angle);
-
-    while (true)
-    {
-        int64_t now = esp_timer_get_time();
-        if (now - prev_time < dt_us) continue;
-        prev_time = now;
-        iteration++;
-
-        // ── Encoder ──────────────────────────────────────────────────────
-        float raw  = readEncoderRaw();
-        float step = raw - previous_raw_angle;
-        if      (step >  180.0f) step -= 360.0f;
-        else if (step < -180.0f) step += 360.0f;
-        current_position   += step;
-        previous_raw_angle  = raw;
-
-        float error = target_position - current_position;
-
-        // ── Compute RPM (before any decisions) ───────────────────────────
-        float rpm = 0.0f;
-        if (fabsf(error) > STOP_DEADBAND)
-        {
-            rpm = Kp * error;
-            rpm = clampf(rpm, -MAX_RPM, MAX_RPM);
-
-            if (fabsf(error) < SLOWDOWN_ANGLE) {
-                float t   = fabsf(error) / SLOWDOWN_ANGLE;
-                float mag = MIN_RPM + t * (MAX_RPM - MIN_RPM);
-                rpm = (rpm >= 0.0f) ? mag : -mag;
-            }
-        }
-
-        float rpm_sent = -rpm;   // inverted as per your fix
-
-        // ── Log EVERYTHING ───────────────────────────────────────────────
-        ESP_LOGI(TAG, "[%03d] raw=%.3f° step=%.3f° pos=%.3f° target=%.3f° "
-                      "error=%.3f° rpm_calc=%.3f rpm_sent=%.3f settle=%d",
-                 iteration, raw, step, current_position, target_position,
-                 error, rpm, rpm_sent, settle_counter);
-
-        // ── Drive ────────────────────────────────────────────────────────
-        Smotor.setSpeed(rpm_sent);
-
-        // ── Settle check ─────────────────────────────────────────────────
-        if (fabsf(error) <= STOP_DEADBAND) {
-            settle_counter++;
-            ESP_LOGI(TAG, "  >> Inside deadband — settle=%d/%d", settle_counter, SETTLE_COUNT);
-            if (settle_counter >= SETTLE_COUNT) {
-                Smotor.setSpeed(0.0f);
-                ESP_LOGI(TAG, "  >> SETTLED — final pos=%.3f° target=%.3f°",
-                         current_position, target_position);
-                return;
-            }
-        } else {
-            settle_counter = 0;
-        }
-
-        // ── Safety exit after 500 iterations (~5s) ───────────────────────
-        if (iteration >= 500) {
-            Smotor.setSpeed(0.0f);
-            ESP_LOGI(TAG, "  >> TIMEOUT — pos=%.3f° target=%.3f° error=%.3f°",
-                     current_position, target_position, error);
-            return;
-        }
-    }
-}
-
-static void debugSpeedRange(void)
-{
-    ESP_LOGI(TAG, "=== SPEED RANGE TEST ===");
-
-    float speeds[] = { 5.0f, 10.0f, 15.0f, 18.0f, 20.0f, 25.0f, 30.0f, -5.0f, -10.0f, -18.0f, -30.0f };
-    int n = sizeof(speeds) / sizeof(speeds[0]);
-
-    for (int i = 0; i < n; i++)
-    {
-        float spd = speeds[i];
-        float before = readEncoderRaw();
-
-        ESP_LOGI(TAG, "[TEST] setSpeed(%.1f) for 1s ...", spd);
-        Smotor.setSpeed(spd);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        Smotor.setSpeed(0.0f);
-        vTaskDelay(pdMS_TO_TICKS(500));   // coast to stop
-
-        float after = readEncoderRaw();
-        float moved = after - before;
-        if      (moved >  180.0f) moved -= 360.0f;
-        else if (moved < -180.0f) moved += 360.0f;
-
-        ESP_LOGI(TAG, "  before=%.3f°  after=%.3f°  moved=%.3f°  %s",
-                 before, after, moved,
-                 fabsf(moved) < 0.5f ? "*** DID NOT MOVE ***" : "OK");
-
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    ESP_LOGI(TAG, "=== SPEED RANGE TEST DONE ===");
-}
-
-void debugUART(void)
-{
-    ESP_LOGI(TAG, "=== UART RAW BYTE DEBUG ===");
-    ESP_LOGI(TAG, "Type something and press Enter...");
-
-    for (int i = 0; i < 20; i++)   // capture up to 20 bytes
-    {
-        uint8_t c = 0;
-        int got = uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(5000));
-        if (got > 0) {
-            ESP_LOGI(TAG, "  byte[%02d]: dec=%3d  hex=0x%02X  char='%c'",
-                     i, c, c, (c >= 32 && c < 127) ? c : '?');
-        } else {
-            ESP_LOGW(TAG, "  byte[%02d]: TIMEOUT — no byte received", i);
-            break;
-        }
-    }
-}
-
-static void testJ3EncoderWhileMoving(void)
-{
-    ESP_LOGI(TAG, "=== J3 ENCODER WHILE MOVING ===");
-
-    // Spin J3 at full duty
-    g_dc1->setDuty(MAX_DUTY_J3);
-
-    for (int i = 0; i < 30; i++) {
-        MotorAngles fb = g_enc->readAll();
-        ESP_LOGI(TAG, "[%02d] j3=%.3f°", i, fb.j3);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    g_dc1->setStop();
-    ESP_LOGI(TAG, "=== DONE ===");
-}
-
-static void testJ3Hardware(void)
-{
-    ESP_LOGI(TAG, "=== J3 HARDWARE TEST ===");
-
-    // TEST 1: g_dc1 both directions
-    ESP_LOGI(TAG, "[TEST 1] g_dc1 setDuty(0.8) for 2s");
-    g_dc1->setDuty(0.8f);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    g_dc1->setStop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    ESP_LOGI(TAG, "[TEST 1] g_dc1 setDuty(-0.8) for 2s");
-    g_dc1->setDuty(-0.8f);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    g_dc1->setStop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    // TEST 2: g_dc2 both directions
-    ESP_LOGI(TAG, "[TEST 2] g_dc2 setDuty(0.8) for 2s");
-    g_dc2->setDuty(0.8f);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    g_dc2->setStop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    ESP_LOGI(TAG, "[TEST 2] g_dc2 setDuty(-0.8) for 2s");
-    g_dc2->setDuty(-0.8f);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    g_dc2->setStop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    // TEST 3: whichever moved J3 — check encoder tracks it
-    ESP_LOGI(TAG, "[TEST 3] Encoder tracking — watch j3 while spinning");
-    g_dc1->setDuty(0.8f);   // change to g_dc2 if that's the one that moved J3
-    for (int i = 0; i < 20; i++) {
-        MotorAngles fb = g_enc->readAll();
-        ESP_LOGI(TAG, "  [%02d] j3=%.3f°  j4=%.3f°", i, fb.j3, fb.j4);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    g_dc1->setStop();
-
-    ESP_LOGI(TAG, "=== J3 HARDWARE TEST DONE ===");
-}
-static void testJ3Pins(void)
-{
-    ESP_LOGI(TAG, "=== J3 PIN BRUTE FORCE TEST ===");
-    ESP_LOGI(TAG, "DC1_PINS[0]=%d DC1_PINS[1]=%d", DC1_PINS[0], DC1_PINS[1]);
-    ESP_LOGI(TAG, "DC2_PINS[0]=%d DC2_PINS[1]=%d", DC2_PINS[0], DC2_PINS[1]);
-    ESP_LOGI(TAG, "DC1_CH[0]=%d DC1_CH[1]=%d", DC1_CH[0], DC1_CH[1]);
-    ESP_LOGI(TAG, "DC2_CH[0]=%d DC2_CH[1]=%d", DC2_CH[0], DC2_CH[1]);
-
-    // Manually toggle every DC pin so you can probe with a multimeter
-    // or watch which wire on the H-bridge goes high
-    uint8_t all_pins[] = { DC1_PINS[0], DC1_PINS[1], DC2_PINS[0], DC2_PINS[1] };
-    const char* names[] = { "DC1_PINS[0]", "DC1_PINS[1]", "DC2_PINS[0]", "DC2_PINS[1]" };
-
-    for (int i = 0; i < 4; i++)
-    {
-        ESP_LOGI(TAG, "[PIN TEST] Driving %s (GPIO %d) HIGH for 3s — does J3 move?",
-                 names[i], all_pins[i]);
-
-        gpio_set_direction((gpio_num_t)all_pins[i], GPIO_MODE_OUTPUT);
-        gpio_set_level((gpio_num_t)all_pins[i], 1);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        gpio_set_level((gpio_num_t)all_pins[i], 0);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    ESP_LOGI(TAG, "=== PIN TEST DONE ===");
-}
-
-static void testJ3DirectPWM(void)
-{
-    ESP_LOGI(TAG, "=== DIRECT PWM TEST ON GPIO 10/11 ===");
-
-    // Bypass HBridge entirely — configure LEDC directly on DC1 pins
-    ledc_timer_config_t t = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_10_BIT,
-        .timer_num       = LEDC_TIMER_3,        // fresh timer, no conflicts
-        .freq_hz         = 1000,
-        .clk_cfg         = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&t);
-
-    ledc_channel_config_t ch0 = {
-        .gpio_num   = 10,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = LEDC_CHANNEL_6,           // fresh channels
-        .intr_type  = LEDC_INTR_DISABLE,
-        .timer_sel  = LEDC_TIMER_3,
-        .duty       = 512,                      // 50% of 1024
-        .hpoint     = 0
-    };
-    ledc_channel_config(&ch0);
-
-    ledc_channel_config_t ch1 = {
-        .gpio_num   = 11,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = LEDC_CHANNEL_7,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .timer_sel  = LEDC_TIMER_3,
-        .duty       = 0,
-        .hpoint     = 0
-    };
-    ledc_channel_config(&ch1);
-
-    ESP_LOGI(TAG, "PWM on GPIO10 ch6 duty=512, GPIO11 ch7 duty=0 — J3 should spin for 3s");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    // Reverse
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_6, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_6);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7, 512);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7);
-
-    ESP_LOGI(TAG, "Reversed — J3 should spin other direction for 3s");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_6, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_6);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7);
-
-    ESP_LOGI(TAG, "=== DIRECT PWM TEST DONE ===");
-}
-*/
-
-// ===========================================================================
-// =================================MAIN======================================
-// ===========================================================================
-
-extern "C" void app_main(void)
-{
-    state = STATE_INIT;
-
-    while (true)
-    {
-        if (state == STATE_INIT)
-        {
-            // NVS flash is required by WiFi driver
-            ESP_ERROR_CHECK(nvs_flash_init());
-
-            if (!wifi_init_sta()) {
-                ESP_LOGE("main", "WiFi failed — halting");
-                return;
-            }
-            //open_gripper();
-            init_mqtt();
-            subscribe_topics();
-            init_hardware();
-            state = STATE_IDLE;
-        }
-        /*else if (state == STATE_IDLE)
-        {
-            if (s_new_message)
-            {
-                s_new_message = false;   // clear flag immediately before parsing
-                if (parse_message())
-                {
-                    state = STATE_EXECUTE_CYCLE;
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "Bad message ignored — staying IDLE");
-                }
-            }
-        }
-        else if (state == STATE_EXECUTE_CYCLE)
-        {
-            if (execute_cycle(s_color, s_j1_target, s_j3_target))
-            {
-                state = STATE_IDLE;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));   // yield to FreeRTOS — never busy-spin*/
-    }
-}
 
 static EventGroupHandle_t s_ctrl_events = nullptr;
 static portMUX_TYPE       s_angle_mux   = portMUX_INITIALIZER_UNLOCKED;
 
 
+//=======================================================================
+//=======================================================================
+//=========================Fin de Pruebas================================
+// ============================MAIN======================================
+// ======================================================================
 
-/*
+static const char* MAIN_TAG = "MAIN_SCARA";
+
+// ── Variable de Estado Global (Totalmente libre de conflictos y MODIFICABLE) ──
+static RobotState g_scara_active_state = STATE_INIT;
+
+// ── Variables del Mensaje MQTT / Serial ──
+static std::string s_last_topic = "";
+static std::string s_last_payload = "";
+
+// ── Variables de Movimiento Incremental (Deltas de movimiento) ──
+float delta_j1 = 0.0f;
+float delta_j2 = 0.0f; // Eje Z
+float delta_j3 = 0.0f;
+float delta_j4 = 0.0f;
+
+
+// =============================================================================
+// UTILIDAD: Función para partir el CSV "10.5,20.0" en un vector de floats
+// =============================================================================
+std::vector<float> parseCSV(const std::string& payload) {
+    std::vector<float> values;
+    std::stringstream ss(payload);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        // strtof convierte el string a float de manera segura sin usar try-catch
+        float val = strtof(item.c_str(), nullptr);
+        values.push_back(val);
+    }
+    return values;
+}
+
+// =============================================================================
+// CONTROL DE MOVIMIENTO: Ejecución en paralelo por incrementos (Deltas)
+// =============================================================================
+static void moveJ1J3Parallel(float j1_delta, float j3_delta)
+{
+    g_j1_done = false;
+    g_j3_done = false;
+
+    // Variables estáticas para pasar referencias seguras a las tareas de FreeRTOS
+    static float j1_arg, j3_arg;
+    j1_arg = j1_delta;
+    j3_arg = j3_delta;
+
+    ESP_LOGI(MAIN_TAG, "[PARALLEL] Aplicando deltas -> J1: %+.2f° | J3: %+.2f°", j1_delta, j3_delta);
+
+    // Se crean las tareas de movimiento (deben estar declaradas arriba en tu archivo)
+    xTaskCreate(taskJ1, "J1_task", 4096, &j1_arg, 5, NULL);
+    xTaskCreate(taskJ3, "J3_task", 4096, &j3_arg, 5, NULL);
+
+    // Espera bloqueante: detiene el ciclo de la FSM hasta que ambos motores terminen
+    while (!g_j1_done || !g_j3_done) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGI(MAIN_TAG, "[PARALLEL] Ambos ejes terminaron su movimiento relativo.");
+}
+
+void MoverJ1_J3(float j1, float j3) {
+    moveJ1J3Parallel(j1, j3);
+}
+
+void MoverManualTodos(float j1, float j2, float j3, float j4) {
+    ESP_LOGI(TAG, "Manual Incremental -> J1:%+.1f, J2(Z):%+.1f, J3:%+.1f, J4:%+.1f", j1, j2, j3, j4);
+    moveJ1J3Parallel(j1, j3);
+    moveJ2_Z_Axis(j2); // Asumiendo que tu eje Z también procesa el delta de entrada
+}
+
+// =============================================================================
+// APP MAIN DEFINITIVO
+// =============================================================================
 extern "C" void app_main(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_task_wdt_deinit();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
     init_hardware();
     uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
 
-    g_j3_current_angle = g_enc->readAll().j3;
-    g_dc1->setStop();
+    g_gripper.begin(); 
 
-    ESP_LOGI(TAG, "=== J1+J3 PARALLEL TEST ===");
-    ESP_LOGI(TAG, "Format: j1,j3  (e.g. '30,45')");
-
-    while (true)
-    {
-        char buf[32] = {};
-        int  idx     = 0;
-
-        printf("\nEnter j1,j3 angles: ");
-        fflush(stdout);
-
-        while (idx == 0) {
-            uint8_t c = 0;
-            if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(10000)) > 0)
-                buf[idx++] = (char)c;
+    // Configuración de red y MQTT (Descoméntalo cuando uses WiFi)
+    
+    if (!wifi_init_sta()) {
+        ESP_LOGE(MAIN_TAG, "WiFi initialization failed after %d retries; aborting startup.", WIFI_MAX_RETRIES);
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-
-        while (idx < (int)sizeof(buf) - 1) {
-            uint8_t c = 0;
-            if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(500)) <= 0) break;
-            if (c == '\r' || c == '\n') break;
-            buf[idx++] = (char)c;
-        }
-        buf[idx] = '\0';
-
-        char* sep = strchr(buf, ',');
-        if (sep == nullptr) {
-            ESP_LOGW(TAG, "Bad format — expected 'j1,j3' e.g. '30,45'");
-            continue;
-        }
-
-        *sep = '\0';
-        char* end1 = nullptr;
-        char* end2 = nullptr;
-        float j1 = strtof(buf,   &end1);
-        float j3 = strtof(sep+1, &end2);
-
-        if (end1 == buf || end2 == sep+1) {
-            ESP_LOGW(TAG, "Parse failed — try again");
-            continue;
-        }
-
-        ESP_LOGI(TAG, "Moving J1=%.2f°  J3=%.2f° in parallel...", j1, j3);
-        moveJ1J3Parallel(j1, j3);
-        ESP_LOGI(TAG, "Done. Ready for next command.");
     }
-}*/
 
+    ESP_LOGI(MAIN_TAG, "Using MQTT broker URI: %s", BROKER_URI.c_str());
+    if (!init_mqtt()) {
+        ESP_LOGE(MAIN_TAG, "MQTT initialization failed; aborting startup.");
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    g_mqtt.subscribe("robot/targets");
+    g_mqtt.subscribe("robot/encoders"); 
+    g_mqtt.subscribe("scara/manual");
+    g_mqtt.subscribe("scara/auto");
+    
+
+    ESP_LOGI(MAIN_TAG, "==========================================");
+    ESP_LOGI(MAIN_TAG, " SISTEMA INCREMENTAL LISTO PARA PRUEBAS");
+    ESP_LOGI(MAIN_TAG, "==========================================");
+
+    static char uart_buf[64];
+    static int u_idx = 0;
+
+    while (1)
+    {
+        // ── PUERTA TRASERA SERIAL DE PRUEBAS ──
+        uint8_t c;
+        if (uart_read_bytes(UART_NUM_0, &c, 1, 0) > 0) {
+            if (c == '\n' || c == '\r') {
+                uart_buf[u_idx] = '\0';
+                std::string cmd(uart_buf);
+                
+                if (cmd.find("AUTO:") == 0) {
+                    s_last_topic = "scara/auto";
+                    s_last_payload = cmd.substr(5);
+                    s_new_message = true;
+                } else if (cmd.find("MANUAL:") == 0) {
+                    s_last_topic = "scara/manual";
+                    s_last_payload = cmd.substr(7);
+                    s_new_message = true;
+                }
+                u_idx = 0; 
+            } else if (u_idx < sizeof(uart_buf) - 1) {
+                uart_buf[u_idx++] = (char)c;
+            }
+        }
+
+        // ── MÁQUINA DE ESTADOS FINITA (FSM) ──
+        switch (g_scara_active_state) 
+        {
+            case STATE_INIT:
+                ESP_LOGI(MAIN_TAG, "[ESTADO] STATE_INIT -> Homing de seguridad...");
+                Z_home();             
+                g_gripper.open();     
+                
+                g_mqtt.publish("scara/status", "HOME_READY");
+                ESP_LOGI(MAIN_TAG, "[SISTEMA] Home completado de inicio. Pasando a IDLE.");
+                g_scara_active_state = STATE_IDLE; // ASIGNACIÓN LIMPIA
+                break;
+
+            case STATE_IDLE: {
+                std::string payload;
+
+                if (g_mqtt.readMessage("scara/manual", payload, 0)) {
+                    cJSON* root = cJSON_Parse(payload.c_str());
+                    if (root) {
+                        cJSON* motor = cJSON_GetObjectItem(root, "motor");
+                        cJSON* angle = cJSON_GetObjectItem(root, "angle");
+
+                        if (motor && angle && cJSON_IsString(motor) && cJSON_IsNumber(angle)) {
+                            float val        = (float)angle->valuedouble;
+                            std::string name = motor->valuestring;
+
+                            delta_j1 = delta_j2 = delta_j3 = delta_j4 = 0.0f;
+
+                            if      (name == "Base")   delta_j1 = val;
+                            else if (name == "Height") delta_j2 = val;
+                            else if (name == "J3")     delta_j3 = val;
+                            else if (name == "J4")     delta_j4 = val;
+                            else ESP_LOGW(MAIN_TAG, "Motor desconocido: %s", name.c_str());
+
+                            ESP_LOGI(MAIN_TAG, "JSON manual: motor=%s angle=%.2f", name.c_str(), val);
+                            g_scara_active_state = STATE_MANUAL_MOVE;
+                        } else {
+                            ESP_LOGW(MAIN_TAG, "Error: JSON manual incompleto!");
+                        }
+                        cJSON_Delete(root);
+                    } else {
+                        ESP_LOGW(MAIN_TAG, "Error: JSON manual invalido!");
+                    }
+                }
+                else if (g_mqtt.readMessage("scara/auto", payload, 0)) {
+                    float v1 = 0, v3 = 0;
+                    int convertidos = sscanf(payload.c_str(), "%f,%f", &v1, &v3);
+
+                    if (convertidos == 2) {
+                        delta_j1 = v1;
+                        delta_j3 = v3;
+                        g_scara_active_state = STATE_AUTO_PICK;
+                    } else {
+                        ESP_LOGW(MAIN_TAG, "Error: Cadena automática inválida!");
+                    }
+                }
+                break;
+            }
+            case STATE_MANUAL_MOVE:
+                ESP_LOGI(MAIN_TAG, "[ESTADO] STATE_MANUAL_MOVE");
+                MoverManualTodos(delta_j1, delta_j2, delta_j3, delta_j4);
+                
+                g_mqtt.publish("scara/status", "MANUAL_DONE");
+                g_scara_active_state = STATE_IDLE; 
+                break;
+
+            case STATE_AUTO_PICK:
+                ESP_LOGI(MAIN_TAG, "[ESTADO] STATE_AUTO_PICK -> Moviendo delta hacia la pieza");
+                MoverJ1_J3(delta_j1, delta_j3);
+                
+                Z_pick();
+                g_gripper.close();
+                vTaskDelay(pdMS_TO_TICKS(500)); 
+                Z_home();
+
+                g_mqtt.publish("scara/status", "LISTO_PARA_PLACE");
+                ESP_LOGI(MAIN_TAG, "[SISTEMA] Pieza sujeta. Esperando delta de destino...");
+                g_scara_active_state = STATE_AUTO_WAIT_PLACE;
+                break;
+
+            case STATE_AUTO_WAIT_PLACE: {
+                std::string payload;
+                if (g_mqtt.readMessage("scara/auto", payload, 0)) {
+                    float v1 = 0, v3 = 0;
+                    int convertidos = sscanf(payload.c_str(), "%f,%f", &v1, &v3);
+
+                    if (convertidos == 2) {
+                        delta_j1 = v1;
+                        delta_j3 = v3;
+                        g_scara_active_state = STATE_AUTO_PLACE;
+                    } else {
+                        ESP_LOGW(MAIN_TAG, "Error: Cadena de place inválida!");
+                    }
+                }
+                break;
+            }
+
+            case STATE_AUTO_PLACE:
+                ESP_LOGI(MAIN_TAG, "[ESTADO] STATE_AUTO_PLACE -> Moviendo delta hacia descarga");
+                MoverJ1_J3(delta_j1, delta_j3);
+                
+                Z_pick();
+                g_gripper.open();
+                vTaskDelay(pdMS_TO_TICKS(500)); 
+                Z_home();
+
+                g_mqtt.publish("scara/status", "HOME_READY");
+                ESP_LOGI(MAIN_TAG, "[SISTEMA] Ciclo Pick & Place terminado de manera incremental.");
+                g_scara_active_state = STATE_IDLE; 
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}

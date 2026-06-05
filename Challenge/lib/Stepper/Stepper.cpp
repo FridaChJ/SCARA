@@ -16,9 +16,9 @@ void Stepper::setup(uint8_t pins[2], uint8_t pwm_channel, TimerConfig* timer_con
 void Stepper::setSpeed(float rpm)
 {
     if (rpm > 0)
-        dir.set(1);
-    else
         dir.set(0);
+    else
+        dir.set(1);
 
     printf("Direction set to %s\n", dir.get() ? "TRUE" : "FALSE");
 

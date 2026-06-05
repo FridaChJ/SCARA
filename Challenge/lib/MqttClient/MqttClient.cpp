@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <chrono>
 
 static const char* TAG = "MQTTClient";
 
@@ -85,20 +86,35 @@ void MQTTClient::start()
 // =============================================================================
 // waitUntilConnected
 // =============================================================================
-void MQTTClient::waitUntilConnected(uint32_t log_every_ms)
+bool MQTTClient::waitUntilConnected(uint32_t timeout_ms, uint32_t log_every_ms)
 {
-    const TickType_t poll   = pdMS_TO_TICKS(100);
-    const uint32_t   period = log_every_ms / 100;   // how many 100 ms ticks per log
-    uint32_t         ticks  = 0;
+    if (client_ == nullptr) {
+        ESP_LOGE(TAG, "waitUntilConnected() called before init()");
+        return false;
+    }
 
-    while (!connected_) {
+    const TickType_t poll   = pdMS_TO_TICKS(100);
+    const uint32_t   period = (log_every_ms > 0) ? (log_every_ms / 100) : 20;   // how many 100 ms ticks per log
+    uint32_t         ticks  = 0;
+    TickType_t       waited = 0;
+    const TickType_t max_wait = (timeout_ms == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+
+    while (!connected_ && waited < max_wait) {
         vTaskDelay(poll);
+        waited += poll;
         ticks++;
         if (ticks % period == 0) {
             ESP_LOGW(TAG, "Not connected yet — retrying... (broker: %s)", broker_uri_.c_str());
         }
     }
-    ESP_LOGI(TAG, "Connected to broker!");
+
+    if (connected_) {
+        ESP_LOGI(TAG, "Connected to broker!");
+        return true;
+    }
+
+    ESP_LOGE(TAG, "MQTT broker connection timed out after %lu ms", (unsigned long)timeout_ms);
+    return false;
 }
 
 // =============================================================================
@@ -183,6 +199,12 @@ void MQTTClient::event_handler(void*            handler_args,
             if (self->message_callback_) {
                 self->message_callback_(topic, message);
             }
+            // Store message in queue for blocking reads
+            {
+                std::lock_guard<std::mutex> lk(self->msg_mutex_);
+                self->message_queue_.emplace_back(topic, message);
+            }
+            self->msg_cv_.notify_all();
             break;
         }
 
@@ -192,5 +214,42 @@ void MQTTClient::event_handler(void*            handler_args,
 
         default:
             break;
+    }
+}
+
+// =============================================================================
+// readMessage
+// =============================================================================
+bool MQTTClient::readMessage(const std::string& topic, std::string& out_message, uint32_t timeout_ms)
+{
+    std::unique_lock<std::mutex> lk(msg_mutex_);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    for (;;) {
+        // Search for a queued message matching the topic
+        for (auto it = message_queue_.begin(); it != message_queue_.end(); ++it) {
+            if (it->first == topic) {
+                out_message = it->second;
+                message_queue_.erase(it);
+                return true;
+            }
+        }
+
+        if (timeout_ms == 0) {
+            return false;
+        }
+
+        if (msg_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
+            // One last check in case a message arrived exactly before timeout
+            for (auto it = message_queue_.begin(); it != message_queue_.end(); ++it) {
+                if (it->first == topic) {
+                    out_message = it->second;
+                    message_queue_.erase(it);
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Otherwise, loop and search again
     }
 }

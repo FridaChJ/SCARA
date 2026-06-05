@@ -15,7 +15,7 @@ constexpr const char* WIFI_SSID     = "GalaxyS23";      // WiFi ID into which th
 constexpr const char* WIFI_PASSWORD = "mazapan16";   // WiFi password into which the ESP is going to connect
 
 //=========================== MQTT Config ===============================
-static const std::string BROKER_URI         = "mqtt://10.48.231.216:1883"; // MQTT broker URI
+static const std::string BROKER_URI         = "mqtt://192.168.196.24:1883"; // MQTT broker URI
 static const std::string BROKER_USER        = "";                     // MQTT broker username
 static const std::string BROKER_PASS        = "";                     // MQTT broker password
 static const std::string TOPIC_MOTOR_ANGLES = "angles/response";   // Topic that receives angles from PC
@@ -36,7 +36,7 @@ static uint8_t DC2_PINS[2] = {12, 13};  // Joint 4 H-bridge pins
 static uint8_t DC2_CH[2]   = {2,  3};   // Joint 4 PWM channels
 
 // Gripper servo
-constexpr int SERVO_PIN     = 0;                           // Gripper servo PWM pin
+constexpr int SERVO_PIN     = 4;                           // Gripper servo PWM pin
 constexpr int SERVO_FREQ_HZ = 50;                            // Standard servo: 50 Hz / 20 ms period
 constexpr int SERVO_OPEN_US  = 1000;                         // Pulse width for open  position (µs) — tune to your servo
 constexpr int SERVO_CLOSE_US = 2000;                         // Pulse width for closed position (µs) — tune to your servo
@@ -79,5 +79,17 @@ define TARGET_READY_BIT   BIT0  // Set when a new target is received from MQTT
 // Event group bits
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
-#define WIFI_MAX_RETRIES    5
+#define WIFI_MAX_RETRIES   10
+
+// States
+enum RobotState {
+    STATE_INIT,              // Homing de Z y abrir gripper
+    STATE_IDLE,              // Esperando comandos
+    STATE_MANUAL_MOVE,       // Moviendo todos los ejes (Manual)
+    STATE_AUTO_PICK,         // Ir a pieza, bajar, agarrar, subir
+    STATE_AUTO_WAIT_PLACE,   // Esperar coordenadas de destino
+    STATE_AUTO_PLACE         // Ir a destino, bajar, soltar, subir
+};
+
+
 #endif // DEFINITIONS_H

@@ -16,6 +16,7 @@ idf_component_register(
         Encoders         # Encoders (AS5600 + QuadratureEncoder)
         HBridge          # HBridge
         SimplePWM       # SimplePWM (needed for TimerConfig)
+        Gripper
         freertos         # vTaskDelayUntil
         log          # ESP_LOGI / ESP_LOGE
         json            # cJSON — ESP-IDF built-in

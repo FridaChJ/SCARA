@@ -9,6 +9,9 @@
 
 #include <string>
 #include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include "mqtt_client.h"
 
 class MQTTClient
@@ -31,9 +34,13 @@ public:
 
     // Block until the broker connection is established.
     // Logs a retry message every `log_every_ms` milliseconds.
-    void waitUntilConnected(uint32_t log_every_ms = 2000);
+    bool waitUntilConnected(uint32_t timeout_ms = 0, uint32_t log_every_ms = 2000);
 
     bool isConnected() const { return connected_; }
+
+    // Blocking read: waits up to `timeout_ms` milliseconds for a message
+    // on `topic`. Returns true and fills `out_message` on success.
+    bool readMessage(const std::string& topic, std::string& out_message, uint32_t timeout_ms = 5000);
 
 private:
     static void event_handler(void*            handler_args,
@@ -47,4 +54,8 @@ private:
     std::string                                     username_;
     std::string                                     password_;
     volatile bool                                   connected_;
+    // Message queue & synchronization for blocking reads
+    std::mutex                                      msg_mutex_;
+    std::condition_variable                         msg_cv_;
+    std::deque<std::pair<std::string, std::string>> message_queue_;
 };
